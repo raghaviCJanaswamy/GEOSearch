@@ -1,0 +1,44 @@
+# Core dependencies
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# Database
+sqlalchemy>=2.0.23
+alembic>=1.13.0
+psycopg2-binary>=2.9.9
+
+# Vector database
+pymilvus>=2.3.0
+
+# Embeddings
+sentence-transformers>=2.2.0
+torch>=2.0.0  # Flexible version for cross-platform compatibility
+openai>=1.6.0
+
+# NCBI/GEO data fetching
+requests>=2.31.0
+biopython>=1.81
+lxml>=4.9.0
+beautifulsoup4>=4.12.0
+
+# UI
+streamlit>=1.29.0
+
+# Utilities
+tenacity>=8.2.0
+ratelimit>=2.2.1
+backoff>=2.2.1
+tqdm>=4.66.0
+
+# Testing
+pytest>=7.4.0
+pytest-cov>=4.1.0
+pytest-mock>=3.12.0
+httpretty>=1.1.0
+
+# Development
+black>=23.12.0
+isort>=5.13.0
+mypy>=1.7.0
+types-requests>=2.31.0
