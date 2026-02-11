@@ -13,6 +13,7 @@ from config import settings
 from db import GSEMesh, GSESeries, IngestItem, IngestRun, MeshTerm, get_db
 from search import HybridSearchEngine
 from search.hybrid_search import make_snippet
+from streamlit_ingest import show_ingestion_interface
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -447,22 +448,30 @@ def render_milvus_view() -> None:
 def main() -> None:
     """Main Streamlit application."""
 
-    # Sidebar navigation
+    # Sidebar navigation - ALWAYS SHOW THIS FIRST
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Select Page:",
-        ["Search", "PostgreSQL View", "Milvus View"],
+        ["Search", "📥 Data Ingestion", "PostgreSQL View", "Milvus View"],
         index=0
     )
 
-    if page == "PostgreSQL View":
+    # Data Ingestion - Always available (no database required for startup)
+    if page == "📥 Data Ingestion":
+        show_ingestion_interface()
+        return
+    
+    # PostgreSQL View - Database required
+    elif page == "PostgreSQL View":
         render_postgres_view()
         return
+    
+    # Milvus View - Milvus required
     elif page == "Milvus View":
         render_milvus_view()
         return
 
-    # Original search page
+    # Original search page (requires database)
     # Header
     st.title("GEOSearch: AI-Powered GEO Dataset Search")
     st.markdown(
@@ -473,12 +482,19 @@ def main() -> None:
     # Sidebar - Filters
     st.sidebar.header("Search Filters")
 
-    # Get filter options
+    # Get filter options with error handling
     try:
         filter_options = get_filter_options()
     except Exception as e:
-        st.error(f"Failed to load filter options: {e}")
-        st.info("Make sure the database is initialized and contains data.")
+        st.error(f"Failed to load search filters: {str(e)}")
+        st.warning(
+            "**Database is not yet ready.** This is normal on first launch.\n\n"
+            "**To get started:**\n"
+            "1. Go to **📥 Data Ingestion** tab in the sidebar\n"
+            "2. Enter a search query (e.g., 'cancer')\n"
+            "3. Click **Start Ingestion**\n\n"
+            "This will load data into the database and enable search."
+        )
         return
 
     # Organism filter
