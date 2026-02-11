@@ -14,6 +14,7 @@ from config import settings
 from db import IngestRun, get_db, engine, init_db
 from db.models import GSESeries, MeshTerm, IngestRun as IngestRunModel
 from geo_ingest.ingest_pipeline import IngestionPipeline
+from streamlit_ingest_mesh import show_mesh_loader
 
 logger = logging.getLogger(__name__)
 
@@ -557,13 +558,15 @@ def show_database_initialization() -> None:
     """Display database initialization interface."""
     st.subheader("Database Management")
     st.write(
-        "Initialize or verify your database tables and view database statistics."
+        "Initialize database tables, load MeSH terms, and view database statistics."
     )
 
-    # Create columns for layout
-    col1, col2 = st.columns(2)
+    # Create tabs for different database operations
+    db_tab1, db_tab2, db_tab3 = st.tabs(
+        ["📊 Database Init", "🏥 MeSH Terms", "📈 Status"]
+    )
 
-    with col1:
+    with db_tab1:
         st.markdown("### Database Initialization")
         st.write("Ensure all tables are properly created and ready for data ingestion.")
 
@@ -575,7 +578,14 @@ def show_database_initialization() -> None:
         ):
             show_init_progress()
 
-    with col2:
+    with db_tab2:
+        st.markdown("### MeSH Terms Management")
+        st.write(
+            "Load Medical Subject Headings (MeSH) into the database for enhanced search capabilities."
+        )
+        show_mesh_loader()
+
+    with db_tab3:
         st.markdown("### Database Status")
         show_database_stats()
 
