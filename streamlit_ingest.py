@@ -22,6 +22,25 @@ def show_ingestion_interface() -> None:
         "Ingest GEO datasets directly from NCBI into your local database."
     )
 
+    # Check database connectivity
+    try:
+        db = next(get_db())
+        db_available = True
+        db.close()
+    except Exception as e:
+        db_available = False
+        st.warning(
+            f"⚠️ **Database Connection Issue**: {str(e)}\n\n"
+            "This is normal on first launch. The system is initializing.\n\n"
+            "**What's happening:**\n"
+            "- PostgreSQL is starting up\n"
+            "- Tables are being created\n"
+            "- Please wait 30-60 seconds and refresh the page\n\n"
+            "**In the meantime, you can:**\n"
+            "- Review the Configuration tab to see current settings\n"
+            "- Check that NCBI_EMAIL is set in your .env file"
+        )
+
     # Create tabs for different ingestion methods
     tab1, tab2, tab3 = st.tabs(
         ["🔍 Query Search", "📋 Ingestion History", "⚙️ Configuration"]
@@ -31,7 +50,10 @@ def show_ingestion_interface() -> None:
         show_query_ingestion()
 
     with tab2:
-        show_ingestion_history()
+        if db_available:
+            show_ingestion_history()
+        else:
+            st.info("Ingestion history will be available once database is ready.")
 
     with tab3:
         show_ingestion_config()
@@ -96,6 +118,19 @@ def show_query_ingestion() -> None:
             st.error("Please enter a search query")
             return
 
+        # Check database before starting
+        try:
+            db_test = next(get_db())
+            db_test.close()
+        except Exception as e:
+            st.error(
+                f"Cannot start ingestion: Database not ready\n\n"
+                f"Error: {str(e)}\n\n"
+                f"**Please wait**: The system is initializing PostgreSQL.\n"
+                f"Refresh the page in 30-60 seconds."
+            )
+            return
+
         ingest_with_progress(
             query=query,
             retmax=retmax,
@@ -123,26 +158,56 @@ def ingest_with_progress(
             status_text = st.empty()
 
             # Get database session
-            db = next(get_db())
+            try:
+                db = next(get_db())
+            except Exception as db_err:
+                st.error(
+                    f"❌ Database Connection Failed\n\n"
+                    f"Error: {str(db_err)}\n\n"
+                    f"**The system is still initializing.** Please:\n"
+                    f"1. Wait 30-60 seconds\n"
+                    f"2. Refresh the page (press F5)\n"
+                    f"3. Try again"
+                )
+                return
 
             # Create ingestion pipeline
-            pipeline = IngestionPipeline(db)
+            try:
+                pipeline = IngestionPipeline(db)
+            except Exception as pipeline_err:
+                st.error(
+                    f"❌ Failed to initialize ingestion pipeline\n\n"
+                    f"Error: {str(pipeline_err)}\n\n"
+                    f"**Possible causes:**\n"
+                    f"- Database tables not yet created\n"
+                    f"- Database schema mismatch\n\n"
+                    f"**Solution**: Refresh the page and wait a moment."
+                )
+                return
 
             # Create ingestion run record
-            run = IngestRun(
-                query=query,
-                start_time=datetime.utcnow(),
-                status="running",
-                run_metadata={
-                    "retmax": retmax,
-                    "mindate": mindate,
-                    "maxdate": maxdate,
-                    "skip_existing": skip_existing,
-                },
-            )
-            db.add(run)
-            db.commit()
-            run_id = run.id
+            try:
+                run = IngestRun(
+                    query=query,
+                    start_time=datetime.utcnow(),
+                    status="running",
+                    run_metadata={
+                        "retmax": retmax,
+                        "mindate": mindate,
+                        "maxdate": maxdate,
+                        "skip_existing": skip_existing,
+                    },
+                )
+                db.add(run)
+                db.commit()
+                run_id = run.id
+            except Exception as run_err:
+                st.error(
+                    f"❌ Failed to create ingestion run\n\n"
+                    f"Error: {str(run_err)}\n\n"
+                    f"Database may not be fully initialized yet."
+                )
+                return
 
             # Update status
             status_text.info(f"⏳ Initializing ingestion (Run ID: {run_id})...")
@@ -193,57 +258,65 @@ def show_ingestion_history() -> None:
     """Display ingestion history and statistics."""
     st.subheader("Ingestion History")
 
-    db = next(get_db())
-
-    # Get recent ingestion runs
-    runs = db.query(IngestRun).order_by(IngestRun.start_time.desc()).limit(20).all()
-
-    if not runs:
-        st.info("No ingestion runs yet. Start by searching and ingesting data!")
+    try:
+        db = next(get_db())
+    except Exception as e:
+        st.warning(f"Cannot access ingestion history: Database not ready\n\nError: {str(e)}")
         return
 
-    # Create display dataframe
-    history_data = []
-    for run in runs:
-        history_data.append({
-            "ID": run.id,
-            "Query": run.query,
-            "Status": run.status,
-            "Total": run.total_count or 0,
-            "Success": run.success_count or 0,
-            "Errors": run.error_count or 0,
-            "Started": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else "-",
-            "Duration": (
-                str(run.end_time - run.start_time).split(".")[0]
-                if run.end_time and run.start_time
-                else "-"
-            ),
-        })
+    try:
+        # Get recent ingestion runs
+        runs = db.query(IngestRun).order_by(IngestRun.start_time.desc()).limit(20).all()
 
-    # Display as table
-    st.dataframe(history_data, use_container_width=True)
+        if not runs:
+            st.info("No ingestion runs yet. Start by searching and ingesting data!")
+            return
 
-    # Show statistics
-    st.subheader("Ingestion Statistics")
+        # Create display dataframe
+        history_data = []
+        for run in runs:
+            history_data.append({
+                "ID": run.id,
+                "Query": run.query,
+                "Status": run.status,
+                "Total": run.total_count or 0,
+                "Success": run.success_count or 0,
+                "Errors": run.error_count or 0,
+                "Started": run.start_time.strftime("%Y-%m-%d %H:%M:%S") if run.start_time else "-",
+                "Duration": (
+                    str(run.end_time - run.start_time).split(".")[0]
+                    if run.end_time and run.start_time
+                    else "-"
+                ),
+            })
 
-    col1, col2, col3, col4 = st.columns(4)
+        # Display as table
+        st.dataframe(history_data, use_container_width=True)
 
-    total_runs = len(runs)
-    total_records = sum(r.total_count or 0 for r in runs)
-    total_success = sum(r.success_count or 0 for r in runs)
-    total_errors = sum(r.error_count or 0 for r in runs)
+        # Show statistics
+        st.subheader("Ingestion Statistics")
 
-    with col1:
-        st.metric("Total Runs", total_runs)
+        col1, col2, col3, col4 = st.columns(4)
 
-    with col2:
-        st.metric("Total Records Fetched", total_records)
+        total_runs = len(runs)
+        total_records = sum(r.total_count or 0 for r in runs)
+        total_success = sum(r.success_count or 0 for r in runs)
+        total_errors = sum(r.error_count or 0 for r in runs)
 
-    with col3:
-        st.metric("Total Successful", total_success)
+        with col1:
+            st.metric("Total Runs", total_runs)
 
-    with col4:
-        st.metric("Total Errors", total_errors)
+        with col2:
+            st.metric("Total Records Fetched", total_records)
+
+        with col3:
+            st.metric("Total Successful", total_success)
+
+        with col4:
+            st.metric("Total Errors", total_errors)
+
+    except Exception as e:
+        st.error(f"Error loading ingestion history: {str(e)}")
 
 
 def show_ingestion_config() -> None:

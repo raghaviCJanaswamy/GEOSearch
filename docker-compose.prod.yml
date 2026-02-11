@@ -89,6 +89,44 @@ services:
     networks:
       - geosearch-network
 
+  # Database initialization service
+  geosearch-init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geosearch-init
+    environment:
+      # Database
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-geosearch}
+      POSTGRES_USER: ${POSTGRES_USER:-geouser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
+      
+      # Milvus
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      MILVUS_COLLECTION_NAME: ${MILVUS_COLLECTION_NAME:-geo_gse_embeddings}
+      
+      # Logging
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+    
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    
+    command: python3 scripts/init_database.py
+    
+    restart: "no"
+    networks:
+      - geosearch-network
+
   # GEOSearch Application
   geosearch-app:
     build:
@@ -146,6 +184,8 @@ services:
         condition: service_healthy
       milvus:
         condition: service_healthy
+      geosearch-init:
+        condition: service_completed_successfully
     
     volumes:
       - ./data:/app/data
