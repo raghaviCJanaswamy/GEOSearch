@@ -13,6 +13,7 @@ from config import settings
 from db import GSEMesh, GSESeries, IngestItem, IngestRun, MeshTerm, get_db
 from search import HybridSearchEngine
 from search.hybrid_search import make_snippet
+from streamlit_ingest import show_ingestion_interface
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -451,11 +452,14 @@ def main() -> None:
     st.sidebar.title("Navigation")
     page = st.sidebar.radio(
         "Select Page:",
-        ["Search", "PostgreSQL View", "Milvus View"],
+        ["Search", "📥 Data Ingestion", "PostgreSQL View", "Milvus View"],
         index=0
     )
 
-    if page == "PostgreSQL View":
+    if page == "📥 Data Ingestion":
+        show_ingestion_interface()
+        return
+    elif page == "PostgreSQL View":
         render_postgres_view()
         return
     elif page == "Milvus View":
