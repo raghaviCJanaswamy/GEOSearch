@@ -6,9 +6,16 @@ Ensures database is properly initialized with all tables and optional sample dat
 import logging
 import sys
 from datetime import datetime
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from sqlalchemy import text
 
 from config import settings
-from db import init_db, get_db
+from db import init_db, get_db, engine
 from db.models import GSESeries, MeshTerm, IngestRun, Base
 
 logging.basicConfig(level=logging.INFO)
@@ -19,10 +26,9 @@ def check_database_connection():
     """Test database connection."""
     logger.info("Checking database connection...")
     try:
-        db = next(get_db())
-        # Simple query to verify connection
-        db.execute("SELECT 1")
-        db.close()
+        # Use engine connection for raw SQL
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
         logger.info("✓ Database connection successful")
         return True
     except Exception as e:
@@ -138,35 +144,17 @@ def main():
     
     logger.info("")
     logger.info("=" * 60)
-    logger.info("Database Initialization Summary")
+    logger.info("Database Initialization Complete")
     logger.info("=" * 60)
     logger.info("")
     
     if stats['gse_count'] == 0:
-        logger.info("ℹ No GEO data ingested yet.")
-        logger.info("  To add data:")
-        logger.info("  1. Open http://localhost:8501")
-        logger.info("  2. Click '📥 Data Ingestion' in sidebar")
-        logger.info("  3. Enter a search query (e.g., 'cancer')")
-        logger.info("  4. Click 'Start Ingestion'")
-        logger.info("")
-        logger.info("Database Status: ✓ READY FOR INGESTION")
+        logger.info("ℹ Database ready for data ingestion")
+        logger.info("  Visit http://localhost:8501 to start ingesting data")
     else:
         logger.info(f"✓ Database contains {stats['gse_count']} GSE records")
-        logger.info("  Ready to search and analyze data")
-        logger.info("")
-        logger.info("Database Status: ✓ READY FOR USE")
     
     logger.info("")
-    logger.info("Configuration:")
-    logger.info(f"  • Host: {settings.postgres_host}")
-    logger.info(f"  • Port: {settings.postgres_port}")
-    logger.info(f"  • Database: {settings.postgres_db}")
-    logger.info(f"  • User: {settings.postgres_user}")
-    
-    logger.info("")
-    logger.info("=" * 60)
-    
     return True
 
 
