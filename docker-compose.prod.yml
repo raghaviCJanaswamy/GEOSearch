@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:15-alpine
+    platform: linux/arm64
     container_name: geo_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
@@ -21,6 +22,7 @@ services:
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
+    platform: linux/arm64
     container_name: milvus-etcd
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -32,15 +34,17 @@ services:
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
     networks:
       - geosearch-network
 
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    platform: linux/arm64
     container_name: milvus-minio
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -53,15 +57,17 @@ services:
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
     networks:
       - geosearch-network
 
   milvus:
     image: milvusdb/milvus:v2.3.3
+    platform: linux/arm64
     container_name: milvus-standalone
     command: ["milvus", "run", "standalone"]
     environment:
@@ -79,34 +85,33 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 30s
-      start_period: 90s
-      timeout: 20s
-      retries: 3
+      interval: 5s
+      start_period: 30s
+      timeout: 10s
+      retries: 20
     restart: unless-stopped
     networks:
       - geosearch-network
 
-  # Database initialization service
+  # Database initialization service — runs once, skipped on restart if tables exist
   geosearch-init:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: geosearch-init
+    env_file:
+      - .env
     environment:
-      # Database
       POSTGRES_HOST: postgres
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
       POSTGRES_USER: ${POSTGRES_USER:-geouser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
-
-      # Milvus
+      # Override POSTGRES_DSN so it uses the Docker service name, not localhost
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-geouser}:${POSTGRES_PASSWORD:-geopass}@postgres:5432/${POSTGRES_DB:-geosearch}
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION_NAME: ${MILVUS_COLLECTION_NAME:-geo_gse_embeddings}
-
-      # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
 
     depends_on:
@@ -119,9 +124,55 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
 
-    command: bash -c "python3 scripts/init_database.py && echo 'Database initialization successful'"
+    # init_database.py uses CREATE TABLE IF NOT EXISTS — safe to run every time
+    command: >
+      bash -c "
+        echo 'Waiting for Postgres to accept connections...' &&
+        until python -c \"import psycopg2; psycopg2.connect(host='$$POSTGRES_HOST', port=$$POSTGRES_PORT, dbname='$$POSTGRES_DB', user='$$POSTGRES_USER', password='$$POSTGRES_PASSWORD')\" 2>/dev/null; do
+          echo 'Postgres not ready yet, retrying in 2s...'; sleep 2;
+        done &&
+        echo 'Postgres ready.' &&
+        python scripts/init_database.py
+      "
 
     restart: "no"
+    networks:
+      - geosearch-network
+
+  # pgAdmin — PostgreSQL GUI (http://localhost:5050)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: geo_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@geosearch.com
+      PGADMIN_DEFAULT_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: 'False'
+    ports:
+      - "5050:80"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./scripts/pgadmin_servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - geosearch-network
+
+  # Attu — official Milvus GUI (http://localhost:8000)
+  attu:
+    image: zilliz/attu:v2.3.10
+    platform: linux/arm64
+    container_name: milvus-attu
+    environment:
+      MILVUS_URL: milvus:19530
+    ports:
+      - "8000:3000"
+    depends_on:
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
     networks:
       - geosearch-network
 
@@ -131,44 +182,37 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: geosearch-app
+    env_file:
+      - .env
     environment:
-      # Database
       POSTGRES_HOST: postgres
       POSTGRES_PORT: ${POSTGRES_PORT:-5432}
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
       POSTGRES_USER: ${POSTGRES_USER:-geouser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
-
-      # Milvus
+      # Override POSTGRES_DSN so it uses the Docker service name, not localhost
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-geouser}:${POSTGRES_PASSWORD:-geopass}@postgres:5432/${POSTGRES_DB:-geosearch}
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION_NAME: ${MILVUS_COLLECTION_NAME:-geo_gse_embeddings}
-
-      # NCBI
       NCBI_EMAIL: ${NCBI_EMAIL:-user@example.com}
       NCBI_API_KEY: ${NCBI_API_KEY:-}
       NCBI_TOOL: GEOSearch
       RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-3.0}
-
-      # Embeddings
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
       EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
-
-      # OpenAI (optional)
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
-
-      # Search
       SEMANTIC_TOP_K: ${SEMANTIC_TOP_K:-100}
       LEXICAL_TOP_K: ${LEXICAL_TOP_K:-100}
       FINAL_TOP_K: ${FINAL_TOP_K:-50}
       RRF_K: ${RRF_K:-60}
-
-      # Logging
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-
-      # Streamlit
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      LLM_MODEL: ${LLM_MODEL:-}
       STREAMLIT_SERVER_PORT: 8501
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_HEADLESS: 'true'
@@ -191,16 +235,96 @@ services:
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 60s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    restart: unless-stopped
+    networks:
+      - geosearch-network
+
+  # Ollama — local LLM server (http://localhost:11434)
+  # Pull a model after first start:  docker exec -it ollama ollama pull llama3
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    networks:
+      - geosearch-network
+
+  # GEOSearch FastAPI — REST API (http://localhost:8000)
+  geosearch-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geosearch-api
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-geosearch}
+      POSTGRES_USER: ${POSTGRES_USER:-geouser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
+      POSTGRES_DSN: postgresql://${POSTGRES_USER:-geouser}:${POSTGRES_PASSWORD:-geopass}@postgres:5432/${POSTGRES_DB:-geosearch}
+      MILVUS_HOST: milvus
+      MILVUS_PORT: 19530
+      MILVUS_COLLECTION_NAME: ${MILVUS_COLLECTION_NAME:-geo_gse_embeddings}
+      NCBI_EMAIL: ${NCBI_EMAIL:-user@example.com}
+      NCBI_API_KEY: ${NCBI_API_KEY:-}
+      NCBI_TOOL: GEOSearch
+      RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-3.0}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-384}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      SEMANTIC_TOP_K: ${SEMANTIC_TOP_K:-100}
+      LEXICAL_TOP_K: ${LEXICAL_TOP_K:-100}
+      FINAL_TOP_K: ${FINAL_TOP_K:-50}
+      RRF_K: ${RRF_K:-60}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LLM_PROVIDER: ${LLM_PROVIDER:-auto}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
+      LLM_MODEL: ${LLM_MODEL:-}
+
+    command: uvicorn api:app --host 0.0.0.0 --port 8080 --workers 2
+
+    ports:
+      - "8080:8080"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      geosearch-init:
+        condition: service_completed_successfully
+
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
     restart: unless-stopped
     networks:
       - geosearch-network
 
 volumes:
+  ollama_data:
+    driver: local
   postgres_data:
     driver: local
   etcd_data:
@@ -208,6 +332,8 @@ volumes:
   minio_data:
     driver: local
   milvus_data:
+    driver: local
+  pgadmin_data:
     driver: local
 
 networks:

@@ -10,7 +10,9 @@ import streamlit as st
 from sqlalchemy import distinct, func
 
 from config import settings
-from db import GSEMesh, GSESeries, IngestItem, IngestRun, MeshTerm, get_db
+from db import GSESeries
+from db.session import SessionLocal
+from llm.qa import generate_answer
 from search import HybridSearchEngine
 from search.hybrid_search import make_snippet
 from streamlit_ingest import show_ingestion_interface
@@ -22,21 +24,54 @@ logger = logging.getLogger(__name__)
 # Page configuration
 st.set_page_config(
     page_title="GEOSearch - AI-Powered GEO Dataset Search",
-    page_icon="🔬",  # Microscope emoji (more compatible)
+    page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
+# Compact sidebar CSS — tight within groups, breathing room between groups
+st.markdown("""
+<style>
+[data-testid="stSidebar"] { min-width: 200px !important; max-width: 220px !important; }
+[data-testid="stSidebar"] section[data-testid="stSidebarContent"] { padding: 10px 12px !important; }
 
-def get_cached_db():
-    """Get database session with caching."""
-    return next(get_db())
+/* Widget labels */
+[data-testid="stSidebar"] label { font-size: 0.78rem !important; margin-bottom: 0 !important; }
+
+/* Widgets — tight spacing within a group */
+[data-testid="stSidebar"] .stSelectbox,
+[data-testid="stSidebar"] .stMultiSelect,
+[data-testid="stSidebar"] .stNumberInput,
+[data-testid="stSidebar"] .stDateInput   { margin-bottom: 6px !important; }
+
+[data-testid="stSidebar"] .stSlider      { margin-bottom: 4px !important; }
+[data-testid="stSidebar"] .stCheckbox    { margin-bottom: 3px !important; }
+[data-testid="stSidebar"] .stRadio       { margin-bottom: 6px !important; }
+
+/* Input fields */
+[data-testid="stSidebar"] input { font-size: 0.78rem !important; padding: 2px 6px !important; }
+
+/* Radio */
+[data-testid="stSidebar"] .stRadio > div { gap: 2px !important; }
+[data-testid="stSidebar"] .stRadio label { font-size: 0.82rem !important; padding: 2px 0 !important; }
+
+/* Checkbox */
+[data-testid="stSidebar"] .stCheckbox label { font-size: 0.78rem !important; }
+
+/* HR — visible group separator with breathing room */
+[data-testid="stSidebar"] hr { margin: 10px 0 !important; border-color: #ddd !important; }
+
+/* Text */
+[data-testid="stSidebar"] p  { font-size: 0.78rem !important; margin: 0 !important; line-height: 1.4 !important; }
+[data-testid="stSidebar"] h3 { font-size: 1rem !important; margin: 0 0 8px 0 !important; }
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=3600)
 def get_filter_options():
     """Get available filter options from database."""
-    db = get_cached_db()
+    db = SessionLocal()
 
     # Get unique organisms
     organisms_query = db.query(
@@ -56,6 +91,7 @@ def get_filter_options():
         func.max(GSESeries.submission_date),
     ).first()
 
+    db.close()
     return {
         "organisms": sorted(organisms),
         "tech_types": sorted(tech_types),
@@ -77,7 +113,7 @@ def perform_search(
     top_k: int,
 ) -> dict[str, Any]:
     """Perform search with caching."""
-    db = get_cached_db()
+    db = SessionLocal()
 
     # Build filters
     filters = {}
@@ -98,16 +134,19 @@ def perform_search(
     if min_samples and min_samples > 0:
         filters["min_samples"] = min_samples
 
-    # Perform search
-    engine = HybridSearchEngine(db)
-    results = engine.search(
-        query=query,
-        filters=filters,
-        use_semantic=use_semantic,
-        use_lexical=use_lexical,
-        use_mesh=use_mesh,
-        top_k=top_k,
-    )
+    try:
+        # Perform search
+        engine = HybridSearchEngine(db)
+        results = engine.search(
+            query=query,
+            filters=filters,
+            use_semantic=use_semantic,
+            use_lexical=use_lexical,
+            use_mesh=use_mesh,
+            top_k=top_k,
+        )
+    finally:
+        db.close()
 
     return results
 
@@ -123,477 +162,234 @@ def render_mesh_term_badge(mesh_term: dict[str, Any]) -> None:
 
 
 def render_result_card(result: dict[str, Any], query_terms: list[str]) -> None:
-    """Render a search result card."""
+    """Render a compact search result card."""
     accession = result["accession"]
-    title = result["title"]
+    title = result["title"] or ""
+    snippet = make_snippet(result.get("summary", "") or "", query_terms, max_length=200) if result.get("summary") else ""
 
-    # Create expandable card
-    with st.container():
-        col1, col2 = st.columns([4, 1])
+    # Metadata pills
+    meta_parts = []
+    if result.get("organisms"):
+        meta_parts.append(f"🧬 {', '.join(result['organisms'][:2])}")
+    if result.get("tech_type") and result["tech_type"] != "unknown":
+        meta_parts.append(f"⚙️ {result['tech_type']}")
+    if result.get("sample_count"):
+        meta_parts.append(f"📊 {result['sample_count']} samples")
+    if result.get("submission_date"):
+        date_str = result["submission_date"][:10]
+        meta_parts.append(f"📅 {date_str}")
+    if result.get("platforms"):
+        gpls = " ".join(
+            f'<a href="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GPL{p}" target="_blank">GPL{p}</a>'
+            for p in result["platforms"][:2]
+        )
+        meta_parts.append(f"🔬 {gpls}")
 
-        with col1:
-            # Title and accession
-            st.markdown(f"### [{accession}]({result['geo_url']})")
-            st.markdown(f"**{title}**")
+    meta_html = "&nbsp;&nbsp;|&nbsp;&nbsp;".join(meta_parts)
 
-            # Snippet
-            if result.get("summary"):
-                snippet = make_snippet(result["summary"], query_terms, max_length=300)
-                st.caption(snippet)
+    # MeSH badges
+    mesh_html = ""
+    if result.get("matched_mesh_terms"):
+        mesh_html = " ".join([
+            f'<span style="background:#e8f5e9;color:#2e7d32;padding:1px 7px;'
+            f'border-radius:10px;font-size:0.78em;">{t["preferred_name"]}</span>'
+            for t in result["matched_mesh_terms"][:5]
+        ])
 
-        with col2:
-            # Metadata
-            if result.get("organisms"):
-                st.caption(f"Organism: {', '.join(result['organisms'][:2])}")
+    # PubMed links
+    pubmed_html = ""
+    if result.get("pubmed_ids"):
+        links = " ".join([
+            f'<a href="https://pubmed.ncbi.nlm.nih.gov/{pmid}/" target="_blank">PMID:{pmid}</a>'
+            for pmid in result["pubmed_ids"][:3]
+        ])
+        pubmed_html = f'<span style="font-size:0.82em;color:#666;">📄 {links}</span>'
 
-            if result.get("tech_type"):
-                st.caption(f"Tech: {result['tech_type']}")
-
-            if result.get("sample_count"):
-                st.caption(f"Samples: {result['sample_count']}")
-
-            if result.get("submission_date"):
-                date_str = result["submission_date"].split("T")[0] if "T" in result["submission_date"] else result["submission_date"]
-                st.caption(f"Date: {date_str}")
-
-        # MeSH terms
-        if result.get("matched_mesh_terms"):
-            st.markdown("**Matched MeSH Terms:**")
-            mesh_html = " ".join([
-                f'<span style="background-color: #e8f5e9; color: #2e7d32; '
-                f'padding: 2px 8px; border-radius: 12px; font-size: 0.85em; '
-                f'margin-right: 4px;">{term["preferred_name"]}</span>'
-                for term in result["matched_mesh_terms"]
-            ])
-            st.markdown(mesh_html, unsafe_allow_html=True)
-
-        # Expandable details
-        with st.expander("Show details"):
-            if result.get("overall_design"):
-                st.markdown("**Overall Design:**")
-                st.write(result["overall_design"])
-
-            if result.get("platforms"):
-                st.markdown("**Platforms:**")
-                st.write(", ".join(result["platforms"]))
-
-            if result.get("pubmed_ids"):
-                st.markdown("**PubMed IDs:**")
-                pmid_links = [
-                    f"[{pmid}](https://pubmed.ncbi.nlm.nih.gov/{pmid}/)"
-                    for pmid in result["pubmed_ids"]
-                ]
-                st.write(", ".join(pmid_links))
-
-        st.divider()
+    card_html = f"""
+<div style="padding:10px 0 6px 0;border-bottom:1px solid #eee;">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px;">
+    <span>
+      <a href="{result['geo_url']}" target="_blank"
+         style="font-weight:700;font-size:1.05em;color:#1976d2;text-decoration:none;">
+        {accession}
+      </a>
+      <span style="font-weight:600;font-size:0.95em;margin-left:10px;">{title}</span>
+    </span>
+  </div>
+  <div style="font-size:0.82em;color:#555;margin:3px 0 4px 0;">{meta_html}</div>
+  {f'<div style="font-size:0.88em;color:#444;margin-bottom:4px;">{snippet}</div>' if snippet else ''}
+  {f'<div style="margin-bottom:3px;">{mesh_html}</div>' if mesh_html else ''}
+  {pubmed_html}
+</div>
+"""
+    st.markdown(card_html, unsafe_allow_html=True)
 
 
-def render_postgres_view() -> None:
-    """Render PostgreSQL database view."""
-    st.header("PostgreSQL Database View")
 
-    db = get_cached_db()
-
-    # Tabs for different views
-    tab1, tab2, tab3, tab4 = st.tabs(["GSE Series", "MeSH Terms", "Ingestion Runs", "Statistics"])
-
+def render_documentation() -> None:
+    """Render user documentation page."""
+    st.title("📚 User Documentation")
+    
+    st.markdown("""
+    Welcome to GEOSearch! This page provides quick access to all documentation.
+    """)
+    
+    # Create tabs for documentation sections
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "🚀 Getting Started",
+        "📊 Data Ingestion", 
+        "🐳 Deployment",
+        "🗄️ Database",
+        "📋 Reference"
+    ])
+    
     with tab1:
-        st.subheader("GSE Series Records")
-
-        # Get all GSE records
-        gse_records = db.query(GSESeries).order_by(GSESeries.created_at.desc()).limit(100).all()
-
-        if gse_records:
-            st.write(f"Showing latest {len(gse_records)} records")
-
-            for gse in gse_records:
-                with st.expander(f"{gse.accession} - {gse.title[:100]}..."):
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.write("**Metadata:**")
-                        st.write(f"- Accession: {gse.accession}")
-                        st.write(f"- Organisms: {', '.join(gse.organisms) if gse.organisms else 'N/A'}")
-                        st.write(f"- Tech Type: {gse.tech_type or 'N/A'}")
-                        st.write(f"- Sample Count: {gse.sample_count or 'N/A'}")
-
-                    with col2:
-                        st.write("**Dates:**")
-                        st.write(f"- Submission: {gse.submission_date.date() if gse.submission_date else 'N/A'}")
-                        st.write(f"- Last Update: {gse.last_update_date.date() if gse.last_update_date else 'N/A'}")
-                        st.write(f"- Created: {gse.created_at.strftime('%Y-%m-%d %H:%M')}")
-
-                    if gse.summary:
-                        st.write("**Summary:**")
-                        st.write(gse.summary[:500] + ("..." if len(gse.summary) > 500 else ""))
-        else:
-            st.info("No GSE records found. Ingest some data first.")
-
+        st.header("Getting Started")
+        st.markdown("""
+        - **[QUICKSTART.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/QUICKSTART.md)** 
+          - Quick setup and first search
+        - **[FIRST_LAUNCH_GUIDE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/FIRST_LAUNCH_GUIDE.md)** 
+          - Step-by-step first launch instructions
+        - **[README.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/README.md)** 
+          - Project overview and features
+        """)
+    
     with tab2:
-        st.subheader("MeSH Terms")
-
-        mesh_terms = db.query(MeshTerm).order_by(MeshTerm.preferred_name).limit(100).all()
-
-        if mesh_terms:
-            st.write(f"Showing {len(mesh_terms)} MeSH terms")
-
-            # Search box for MeSH terms
-            search_term = st.text_input("Search MeSH terms:")
-
-            if search_term:
-                filtered_terms = [
-                    term for term in mesh_terms
-                    if search_term.lower() in term.preferred_name.lower()
-                ]
-            else:
-                filtered_terms = mesh_terms[:20]
-
-            for term in filtered_terms:
-                with st.expander(f"{term.mesh_id}: {term.preferred_name}"):
-                    st.write(f"**Descriptor UI:** {term.descriptor_ui}")
-                    if term.entry_terms:
-                        st.write("**Entry Terms (Synonyms):**")
-                        for entry_term in term.entry_terms[:10]:
-                            st.write(f"  - {entry_term}")
-                    if term.tree_numbers:
-                        st.write(f"**Tree Numbers:** {', '.join(term.tree_numbers)}")
-        else:
-            st.info("No MeSH terms found. Load MeSH data first: `python -m mesh.loader --sample`")
-
+        st.header("Data Ingestion")
+        st.markdown("""
+        - **[STREAMLIT_INGESTION_QUICKREF.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/STREAMLIT_INGESTION_QUICKREF.md)** 
+          - Quick reference for the Data Ingestion UI
+        - **[STREAMLIT_INGESTION_GUIDE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/STREAMLIT_INGESTION_GUIDE.md)** 
+          - Complete ingestion guide
+        - **[PRODUCTION_DATA_INGESTION.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/PRODUCTION_DATA_INGESTION.md)** 
+          - Production ingestion procedures
+        """)
+    
     with tab3:
-        st.subheader("Ingestion Runs")
-
-        runs = db.query(IngestRun).order_by(IngestRun.start_time.desc()).limit(20).all()
-
-        if runs:
-            for run in runs:
-                status_color = {
-                    "completed": "🟢",
-                    "running": "🟡",
-                    "failed": "🔴",
-                    "partial": "🟠"
-                }.get(run.status, "⚪")
-
-                with st.expander(f"{status_color} Run #{run.id} - {run.query[:50]}"):
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        st.write(f"**Query:** {run.query}")
-                        st.write(f"**Status:** {run.status}")
-                        st.write(f"**Started:** {run.start_time.strftime('%Y-%m-%d %H:%M:%S')}")
-                        if run.end_time:
-                            duration = (run.end_time - run.start_time).total_seconds()
-                            st.write(f"**Duration:** {duration:.1f}s")
-
-                    with col2:
-                        st.write(f"**Total:** {run.total_count}")
-                        st.write(f"**Success:** {run.success_count}")
-                        st.write(f"**Errors:** {run.error_count}")
-                        if run.total_count > 0:
-                            success_rate = (run.success_count / run.total_count) * 100
-                            st.write(f"**Success Rate:** {success_rate:.1f}%")
-
-                    # Show failed items
-                    if run.error_count > 0:
-                        failed_items = db.query(IngestItem).filter(
-                            IngestItem.run_id == run.id,
-                            IngestItem.status == "failed"
-                        ).limit(5).all()
-
-                        if failed_items:
-                            st.write("**Failed Items:**")
-                            for item in failed_items:
-                                st.write(f"  - {item.accession}: {item.error_message[:100]}")
-        else:
-            st.info("No ingestion runs found.")
-
+        st.header("Docker Deployment")
+        st.markdown("""
+        - **[DOCKER_DEPLOYMENT_QUICK_REFERENCE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/DOCKER_DEPLOYMENT_QUICK_REFERENCE.md)** 
+          - Essential Docker commands
+        - **[DEPLOYMENT_GUIDE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/DEPLOYMENT_GUIDE.md)** 
+          - Full deployment walkthrough
+        - **[DOCKER_VISUAL_GUIDE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/DOCKER_VISUAL_GUIDE.md)** 
+          - Visual guide to Docker architecture
+        """)
+    
     with tab4:
-        st.subheader("Database Statistics")
-
-        from sqlalchemy import func
-
-        # GSE stats
-        gse_count = db.query(func.count(GSESeries.accession)).scalar()
-        st.metric("Total GSE Records", gse_count)
-
-        if gse_count > 0:
-            # Date range
-            min_date, max_date = db.query(
-                func.min(GSESeries.submission_date),
-                func.max(GSESeries.submission_date)
-            ).first()
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-                if min_date:
-                    st.metric("Earliest Record", str(min_date.date()))
-
-            with col2:
-                if max_date:
-                    st.metric("Latest Record", str(max_date.date()))
-
-            with col3:
-                avg_samples = db.query(func.avg(GSESeries.sample_count)).scalar()
-                if avg_samples:
-                    st.metric("Avg Samples", f"{avg_samples:.1f}")
-
-            # Top organisms
-            st.write("**Top Organisms:**")
-            org_query = db.query(
-                func.jsonb_array_elements_text(GSESeries.organisms).label("organism"),
-                func.count().label("count")
-            ).group_by("organism").order_by(func.count().desc()).limit(10)
-
-            for org, count in org_query:
-                st.write(f"  - {org}: {count}")
-
-            # Tech types
-            st.write("**Technology Types:**")
-            tech_query = db.query(
-                GSESeries.tech_type,
-                func.count()
-            ).filter(GSESeries.tech_type.isnot(None)).group_by(
-                GSESeries.tech_type
-            ).order_by(func.count().desc()).all()
-
-            for tech, count in tech_query:
-                st.write(f"  - {tech}: {count}")
-
-        # MeSH stats
-        mesh_count = db.query(func.count(MeshTerm.mesh_id)).scalar()
-        st.metric("Total MeSH Terms", mesh_count)
-
-        # GSE-MeSH associations
-        assoc_count = db.query(func.count(GSEMesh.id)).scalar()
-        st.metric("GSE-MeSH Associations", assoc_count)
-
-
-def render_milvus_view() -> None:
-    """Render Milvus vector database view."""
-    st.header("Milvus Vector Database View")
-
-    try:
-        from vector.milvus_store import MilvusStore
-
-        store = MilvusStore()
-
-        # Collection info
-        st.subheader("Collection Information")
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            vector_count = store.count()
-            st.metric("Total Vectors", vector_count)
-
-        with col2:
-            st.metric("Collection Name", store.collection_name)
-
-        with col3:
-            st.metric("Vector Dimension", store.dimension)
-
-        # Connection info
-        st.subheader("Connection Details")
-        st.write(f"**Host:** {store.host}")
-        st.write(f"**Port:** {store.port}")
-
-        # Collection schema
-        st.subheader("Collection Schema")
-        try:
-            schema = store.collection.schema
-            st.write("**Fields:**")
-            for field in schema.fields:
-                st.write(f"  - {field.name} ({field.dtype})")
-        except Exception as e:
-            st.warning(f"Could not retrieve schema: {e}")
-
-        # Sample query
-        st.subheader("Test Query")
-
-        test_query = st.text_input("Enter test query:", "cancer")
-
-        if st.button("Run Test Search"):
-            if test_query:
-                with st.spinner("Searching..."):
-                    from vector.embeddings import get_embedding_provider
-
-                    embedding_provider = get_embedding_provider()
-                    query_embedding = embedding_provider.embed_texts([test_query])[0]
-
-                    results = store.search(
-                        query_vector=query_embedding,
-                        top_k=10
-                    )
-
-                    if results:
-                        st.success(f"Found {len(results)} results")
-
-                        for idx, result in enumerate(results, 1):
-                            st.write(f"{idx}. **{result['accession']}** - Score: {result['score']:.4f}")
-                    else:
-                        st.info("No results found")
-
-        # Collection stats
-        if vector_count > 0:
-            st.subheader("Statistics")
-            st.write(f"**Vectors stored:** {vector_count:,}")
-            st.write(f"**Estimated storage:** ~{(vector_count * store.dimension * 4 / 1024 / 1024):.2f} MB")
-
-    except Exception as e:
-        st.error(f"Error connecting to Milvus: {str(e)}")
-        st.info("Make sure Milvus is running: `docker compose ps milvus`")
+        st.header("Database Management")
+        st.markdown("""
+        - **[DATABASE_INITIALIZATION.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/DATABASE_INITIALIZATION.md)** 
+          - Database setup and initialization
+        - **[MAINTENANCE_OPERATIONS_GUIDE.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/MAINTENANCE_OPERATIONS_GUIDE.md)** 
+          - Database maintenance tasks
+        """)
+    
+    with tab5:
+        st.header("Technical Reference")
+        st.markdown("""
+        - **[ARCHITECTURE_EXPLANATION.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/ARCHITECTURE_EXPLANATION.md)** 
+          - System architecture details
+        - **[MESH_INTEGRATION_SUMMARY.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/MESH_INTEGRATION_SUMMARY.md)** 
+          - MeSH terminology integration
+        - **[PROJECT_SUMMARY.md](https://github.com/raghaviCJanaswamy/GEOSearch/blob/master/docs/PROJECT_SUMMARY.md)** 
+          - Project technical overview
+        """)
+    
+    st.divider()
+    
+    # Quick links section
+    st.subheader("Quick Help")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("🔍 How to Search", key="help_search", use_container_width=True):
+            st.info("Go to the **Search** tab to find GEO datasets using semantic search, keywords, or MeSH terms.")
+    
+    with col2:
+        if st.button("📥 How to Ingest Data", key="help_ingest", use_container_width=True):
+            st.info("Go to the **Data Ingestion** tab to add new datasets from NCBI GEO.")
+    
+    with col3:
+        if st.button("🐳 Docker Help", key="help_docker", use_container_width=True):
+            st.info("See DOCKER_DEPLOYMENT_QUICK_REFERENCE.md for common Docker commands.")
 
 
 def main() -> None:
     """Main Streamlit application."""
 
-    # Sidebar navigation - ALWAYS SHOW THIS FIRST
-    st.sidebar.title("Navigation")
+    # Sidebar navigation
+    st.sidebar.markdown("### 🔬 GEOSearch")
     page = st.sidebar.radio(
-        "Select Page:",
-        ["Search", "📥 Data Ingestion", "PostgreSQL View", "Milvus View"],
-        index=0
+        "nav", ["🔍 Search", "📥 Ingest", "📚 Docs"],
+        index=0, label_visibility="collapsed",
     )
 
-    # Data Ingestion - Always available (no database required for startup)
-    if page == "📥 Data Ingestion":
+    if page == "📚 Docs":
+        render_documentation()
+        return
+
+    if page == "📥 Ingest":
         show_ingestion_interface()
         return
-    
-    # PostgreSQL View - Database required
-    elif page == "PostgreSQL View":
-        render_postgres_view()
-        return
-    
-    # Milvus View - Milvus required
-    elif page == "Milvus View":
-        render_milvus_view()
-        return
-
-    # Original search page (requires database)
-    # Header
-    st.title("GEOSearch: AI-Powered GEO Dataset Search")
-    st.markdown(
-        "Search NCBI GEO datasets using semantic search, keyword matching, "
-        "and MeSH terminology expansion."
-    )
 
     # Sidebar - Filters
-    st.sidebar.header("Search Filters")
+    st.sidebar.markdown("---")
 
-    # Get filter options with error handling
     try:
         filter_options = get_filter_options()
     except Exception as e:
-        st.error(f"Failed to load search filters: {str(e)}")
-        st.warning(
-            "**Database is not yet ready.** This is normal on first launch.\n\n"
-            "**To get started:**\n"
-            "1. Go to **📥 Data Ingestion** tab in the sidebar\n"
-            "2. Enter a search query (e.g., 'cancer')\n"
-            "3. Click **Start Ingestion**\n\n"
-            "This will load data into the database and enable search."
-        )
+        st.error(f"Database not ready: {str(e)}")
+        st.info("Go to **📥 Ingest** to load data first.")
         return
 
-    # Organism filter
     organisms = st.sidebar.multiselect(
-        "Organisms",
-        options=filter_options["organisms"],
-        default=None,
-        help="Filter by organism(s)",
-    )
+        "Organism", options=filter_options["organisms"], default=None,
+        placeholder="All")
 
-    # Technology type filter
     tech_type = st.sidebar.selectbox(
-        "Technology Type",
-        options=["All"] + filter_options["tech_types"],
-        index=0,
-        help="Filter by sequencing/array technology",
-    )
+        "Tech", options=["All"] + filter_options["tech_types"], index=0)
 
-    # Date range filter
-    st.sidebar.subheader("Submission Date Range")
     date_min, date_max = filter_options["date_range"]
-
     if date_min and date_max:
-        date_start = st.sidebar.date_input(
-            "Start date",
-            value=None,
-            min_value=date_min.date() if date_min else None,
-            max_value=date_max.date() if date_max else None,
-        )
-
-        date_end = st.sidebar.date_input(
-            "End date",
-            value=None,
-            min_value=date_min.date() if date_min else None,
-            max_value=date_max.date() if date_max else None,
-        )
+        date_start = st.sidebar.date_input("From", value=None,
+            min_value=date_min.date(), max_value=date_max.date())
+        date_end = st.sidebar.date_input("To", value=None,
+            min_value=date_min.date(), max_value=date_max.date())
     else:
-        date_start = None
-        date_end = None
+        date_start = date_end = None
 
-    # Sample count filter
-    min_samples = st.sidebar.number_input(
-        "Minimum Samples",
-        min_value=0,
-        value=0,
-        step=1,
-        help="Minimum number of samples in dataset",
+    min_samples = st.sidebar.number_input("Min Samples", min_value=0, value=0, step=10)
+
+    st.sidebar.markdown("---")
+    use_semantic = st.sidebar.checkbox("Semantic", value=True, help="AI vector similarity")
+    use_lexical  = st.sidebar.checkbox("Keyword",  value=True, help="Full-text search")
+    use_mesh     = st.sidebar.checkbox("MeSH",     value=True, help="Medical synonym expansion")
+    top_k = st.sidebar.slider("Results", min_value=10, max_value=200, value=50, step=10)
+
+    st.sidebar.markdown("---")
+    use_llm = st.sidebar.checkbox("Ask AI", value=True, help="LLM answer from top results")
+    llm_model = st.sidebar.selectbox(
+        "LLM Model",
+        options=["llama3", "mistral", "gpt-4o-mini", "gpt-4o", "gpt-3.5-turbo"],
+        index=0,
+        help="Local: llama3/mistral (Ollama). Cloud: gpt-* (OpenAI key required)",
     )
 
-    # Search options
-    st.sidebar.header("Search Options")
-
-    use_semantic = st.sidebar.checkbox(
-        "Use Semantic Search",
-        value=True,
-        help="Enable AI-powered semantic similarity search",
-    )
-
-    use_lexical = st.sidebar.checkbox(
-        "Use Keyword Search",
-        value=True,
-        help="Enable traditional keyword matching",
-    )
-
-    use_mesh = st.sidebar.checkbox(
-        "Use MeSH Expansion",
-        value=True,
-        help="Expand query with MeSH medical terminology",
-    )
-
-    top_k = st.sidebar.slider(
-        "Number of Results",
-        min_value=10,
-        max_value=200,
-        value=50,
-        step=10,
-        help="Maximum number of results to display",
-    )
-
-    # Main search area
-    st.header("Search")
-
-    # Search input
-    query = st.text_input(
-        "Enter your search query:",
-        placeholder="e.g., breast cancer RNA-seq, single-cell diabetes, mouse liver expression",
-        help="Enter keywords, phrases, or natural language queries",
-    )
-
-    # Search button
-    col1, col2, col3 = st.columns([1, 1, 4])
-    with col1:
+    # Main search area — compact single row: [query input] [Search] [Clear Cache]
+    col_q, col_s, col_c = st.columns([6, 1, 1])
+    with col_q:
+        query = st.text_input(
+            "query",
+            placeholder="e.g., breast cancer RNA-seq, heart attack, single-cell diabetes",
+            label_visibility="collapsed",
+        )
+    with col_s:
         search_clicked = st.button("Search", type="primary", use_container_width=True)
-
-    with col2:
+    with col_c:
         clear_cache = st.button("Clear Cache", use_container_width=True)
         if clear_cache:
             st.cache_data.clear()
-            st.success("Cache cleared!")
             st.rerun()
 
     # Perform search
@@ -617,7 +413,7 @@ def main() -> None:
                 result_list = results["results"]
 
                 # Display search metadata
-                st.success(f"Found {metadata['total_results']} results")
+                st.caption(f"Found {metadata['total_results']} results")
 
                 # Show MeSH expansion
                 if use_mesh and metadata.get("mesh_terms"):
@@ -632,13 +428,39 @@ def main() -> None:
                         ])
                         st.markdown(mesh_html, unsafe_allow_html=True)
 
+                # LLM answer panel
+                if use_llm and result_list:
+                    with st.spinner("Generating AI answer..."):
+                        try:
+                            answer_text, provider = generate_answer(
+                                question=query,
+                                results=result_list,
+                                llm_provider=settings.llm_provider,
+                                llm_model=llm_model,
+                                openai_api_key=settings.openai_api_key,
+                                ollama_base_url=settings.ollama_base_url,
+                                ollama_model=settings.ollama_model,
+                            )
+                            provider_label = {
+                                "ollama": "🦙 AI Answer (Ollama — local)",
+                                "openai": "🤖 AI Answer (OpenAI)",
+                                "none": "📋 Summary",
+                            }.get(provider, "📋 Summary")
+                            with st.container(border=True):
+                                st.markdown(f"**{provider_label}**")
+                                st.markdown(answer_text)
+                                if provider == "none":
+                                    st.caption(
+                                        "No LLM active. Run Ollama locally or set OPENAI_API_KEY in .env."
+                                    )
+                        except Exception as llm_err:
+                            logger.warning(f"LLM answer skipped: {llm_err}")
+
                 # Display results
                 if result_list:
-                    st.markdown(f"### Results (1-{len(result_list)})")
-
+                    st.markdown(f"**{len(result_list)} results**")
                     query_terms = query.lower().split()
-
-                    for idx, result in enumerate(result_list, 1):
+                    for result in result_list:
                         render_result_card(result, query_terms)
                 else:
                     st.warning("No results found. Try adjusting your search query or filters.")
@@ -656,20 +478,8 @@ def main() -> None:
     elif search_clicked and not query:
         st.warning("Please enter a search query.")
 
-    # Footer
     st.sidebar.markdown("---")
-    st.sidebar.markdown(
-        """
-        **About GEOSearch**
-
-        GEOSearch combines:
-        - Semantic AI search
-        - Keyword matching
-        - MeSH terminology
-
-        Data from [NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/)
-        """
-    )
+    st.sidebar.caption("Data from [NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/)")
 
 
 if __name__ == "__main__":

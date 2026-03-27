@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     postgres_db: str = "geosearch"
     postgres_user: str = "geouser"
-    postgres_password: str = "geopass"
+    postgres_password: str = Field(default="", description="Set via POSTGRES_PASSWORD env var")
     postgres_dsn: str | None = None
 
     # Milvus
@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str | None = None
     openai_embedding_model: str = "text-embedding-3-small"
+
+    # LLM Q&A
+    llm_provider: str = "auto"           # "auto" | "ollama" | "openai" | "none"
+    llm_model: str | None = None         # override model name per provider
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "llama3"         # model tag pulled in Ollama
 
     # Search
     semantic_top_k: int = 100

@@ -20,6 +20,9 @@ class MeSHMatcher:
     Matches MeSH terms against dataset text fields.
     """
 
+    # Class-level cache so MeSH terms are only loaded once per process
+    _term_lookup_cache: dict[str, list[str]] | None = None
+
     def __init__(self, db: Session):
         """
         Initialize matcher.
@@ -29,34 +32,37 @@ class MeSHMatcher:
         """
         self.db = db
 
-        # Load MeSH terms into memory for faster matching
-        self._load_mesh_terms()
+        # Load MeSH terms into memory for faster matching (cached at class level)
+        if MeSHMatcher._term_lookup_cache is None:
+            self._load_mesh_terms()
+        self.term_lookup = MeSHMatcher._term_lookup_cache
 
     def _load_mesh_terms(self) -> None:
-        """Load all MeSH terms from database."""
+        """Load all MeSH terms from database into class-level cache."""
         logger.info("Loading MeSH terms for matching...")
 
         terms = self.db.query(MeshTerm).all()
 
         # Build lookup dictionary: term_text -> mesh_id
-        self.term_lookup: dict[str, list[str]] = {}
+        term_lookup: dict[str, list[str]] = {}
 
         for term in terms:
             # Add preferred name
             preferred = term.preferred_name.lower()
-            if preferred not in self.term_lookup:
-                self.term_lookup[preferred] = []
-            self.term_lookup[preferred].append(term.mesh_id)
+            if preferred not in term_lookup:
+                term_lookup[preferred] = []
+            term_lookup[preferred].append(term.mesh_id)
 
             # Add entry terms (synonyms)
             if term.entry_terms:
                 for entry in term.entry_terms:
                     entry_lower = entry.lower()
-                    if entry_lower not in self.term_lookup:
-                        self.term_lookup[entry_lower] = []
-                    self.term_lookup[entry_lower].append(term.mesh_id)
+                    if entry_lower not in term_lookup:
+                        term_lookup[entry_lower] = []
+                    term_lookup[entry_lower].append(term.mesh_id)
 
-        logger.info(f"Loaded {len(terms)} MeSH terms with {len(self.term_lookup)} searchable variants")
+        MeSHMatcher._term_lookup_cache = term_lookup
+        logger.info(f"Loaded {len(terms)} MeSH terms with {len(term_lookup)} searchable variants")
 
     def match_gse(
         self,

@@ -1,0 +1,15 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "GEOSearch PostgreSQL",
+      "Group": "Servers",
+      "Host": "postgres",
+      "Port": 5432,
+      "MaintenanceDB": "geosearch",
+      "Username": "geouser",
+      "Password": "geopass",
+      "SSLMode": "prefer",
+      "SavePassword": true
+    }
+  }
+}

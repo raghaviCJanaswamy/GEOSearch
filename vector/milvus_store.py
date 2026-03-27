@@ -3,6 +3,7 @@ Milvus vector store for GEO embeddings.
 Manages collection creation, upsertion, and similarity search.
 """
 import logging
+import time
 from typing import Any
 
 from pymilvus import (
@@ -80,11 +81,29 @@ class MilvusStore:
             logger.info(f"Collection '{self.collection_name}' exists")
             self.collection = Collection(self.collection_name)
 
-            # Load collection into memory for search
-            self.collection.load()
+            # Load collection into memory — retry up to 3 times to handle
+            # cold-start delay while Milvus loads segments from MinIO.
+            self._load_with_retry()
         else:
             logger.info(f"Creating collection '{self.collection_name}'")
             self._create_collection()
+
+    def _load_with_retry(self, retries: int = 3, delay: float = 5.0) -> None:
+        """Load collection into memory, retrying on failure (cold-start tolerance)."""
+        for attempt in range(1, retries + 1):
+            try:
+                self.collection.load()
+                logger.info(f"Collection '{self.collection_name}' loaded into memory")
+                return
+            except MilvusException as e:
+                if attempt < retries:
+                    logger.warning(f"Collection load attempt {attempt} failed: {e}. Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    logger.warning(
+                        f"Collection load deferred after {retries} attempts: {e}. "
+                        "Search will retry on first query."
+                    )
 
     def _create_collection(self) -> None:
         """
@@ -116,11 +135,13 @@ class MilvusStore:
             schema=schema,
         )
 
-        # Create IVF_FLAT index for similarity search
+        # Use FLAT index by default; safe for small collections.
+        # IVF_FLAT requires >= nlist training vectors and is better suited
+        # for large collections (rebuild index manually once data grows).
         index_params = {
             "metric_type": "IP",  # Inner Product (cosine similarity)
-            "index_type": "IVF_FLAT",
-            "params": {"nlist": 1024},
+            "index_type": "FLAT",
+            "params": {},
         }
 
         self.collection.create_index(
@@ -130,8 +151,8 @@ class MilvusStore:
 
         logger.info(f"Created collection '{self.collection_name}' with index")
 
-        # Load collection
-        self.collection.load()
+        # Load collection (best-effort; upsert does not require it)
+        self._load_with_retry()
 
     def upsert_embeddings(
         self,
@@ -160,13 +181,12 @@ class MilvusStore:
         logger.info(f"Upserting {len(embeddings)} embeddings")
 
         try:
-            # Milvus automatically handles upserts based on primary key
             data = [
                 accessions,
                 vectors,
             ]
 
-            self.collection.insert(data)
+            self.collection.upsert(data)
             self.collection.flush()
 
             logger.info(f"Successfully upserted {len(embeddings)} embeddings")
@@ -210,6 +230,12 @@ class MilvusStore:
 
         logger.debug(f"Searching Milvus: top_k={top_k}, filter={filter_expr}")
 
+        # Ensure collection is loaded before searching (lazy load after cold start)
+        try:
+            self.collection.load()
+        except MilvusException as e:
+            logger.warning(f"Collection load before search: {e}")
+
         try:
             results = self.collection.search(
                 data=[query_vector],
@@ -247,7 +273,8 @@ class MilvusStore:
         if not accessions:
             return
 
-        expr = f"accession in {accessions}"
+        quoted = ", ".join(f'"{a}"' for a in accessions)
+        expr = f"accession in [{quoted}]"
         logger.info(f"Deleting {len(accessions)} embeddings")
 
         try:
