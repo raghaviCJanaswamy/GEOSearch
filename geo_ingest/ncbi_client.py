@@ -9,7 +9,6 @@ from xml.etree import ElementTree as ET
 
 import backoff
 import requests
-from ratelimit import limits, sleep_and_retry
 
 from config import settings
 
@@ -69,14 +68,8 @@ class NCBIClient:
             params["api_key"] = self.api_key
         return params
 
-    @sleep_and_retry
-    @limits(calls=1, period=1)  # Will be dynamically adjusted in __call__
     def _rate_limited_request(self, url: str, params: dict[str, Any]) -> requests.Response:
-        """
-        Make a rate-limited HTTP request.
-        The decorator handles the rate limiting based on self.rate_limit.
-        """
-        # Dynamic sleep to respect configured rate limit
+        """Make a rate-limited HTTP request."""
         time.sleep(1.0 / self.rate_limit)
         return self.session.get(url, params=params, timeout=30)
 
@@ -146,8 +139,10 @@ class NCBIClient:
 
         if mindate:
             params["mindate"] = mindate
+            params["datetype"] = "pdat"
         if maxdate:
             params["maxdate"] = maxdate
+            params["datetype"] = "pdat"
 
         logger.info(f"Searching GEO: query='{query}', retmax={retmax}, retstart={retstart}")
 
@@ -173,22 +168,26 @@ class NCBIClient:
         if not gse_ids:
             return {}
 
-        params = {
-            "db": "gds",
-            "id": ",".join(gse_ids),
-            "retmode": "json",
-        }
-
         logger.info(f"Fetching summaries for {len(gse_ids)} GSE records")
 
-        response = self._make_request("esummary.fcgi", params)
-        data = response.json()
+        # Batch into chunks of 200 to avoid 414 Request-URI Too Long
+        batch_size = 200
+        result: dict[str, Any] = {}
+        for i in range(0, len(gse_ids), batch_size):
+            batch = gse_ids[i:i + batch_size]
+            params = {
+                "db": "gds",
+                "id": ",".join(batch),
+                "retmode": "json",
+            }
+            response = self._make_request("esummary.fcgi", params)
+            data = response.json()
+            batch_result = data.get("result", {})
+            batch_result.pop("uids", None)
+            result.update(batch_result)
+            logger.info(f"Fetched batch {i // batch_size + 1}: {len(batch_result)} summaries")
 
-        result = data.get("result", {})
-        # Remove metadata keys
-        result.pop("uids", None)
-
-        logger.info(f"Retrieved {len(result)} summaries")
+        logger.info(f"Retrieved {len(result)} summaries total")
         return result
 
     def fetch_gse_text(self, gse_accession: str) -> dict[str, Any]:
@@ -264,6 +263,24 @@ class NCBIClient:
         }
 
         return parsed
+
+    def _build_parsed_from_summary(self, gse_accession: str, summary_data: dict[str, Any]) -> dict[str, Any]:
+        """Build a parsed metadata dict from an already-fetched ESummary record."""
+        return {
+            "accession": gse_accession,
+            "title": summary_data.get("title", ""),
+            "summary": summary_data.get("summary", ""),
+            "overall_design": "",
+            "type": summary_data.get("gdstype", ""),
+            "platform_ids": [summary_data.get("gpl", "")] if summary_data.get("gpl") else [],
+            "sample_ids": [],
+            "pubmed_ids": [],
+            "taxon": summary_data.get("taxon", ""),
+            "entrez_date": summary_data.get("pdat", ""),
+            "submission_date": summary_data.get("pdat", ""),
+            "n_samples": summary_data.get("n_samples", ""),
+            "organisms": [summary_data.get("taxon", "")] if summary_data.get("taxon") else [],
+        }
 
     def _parse_gse_xml(self, root: ET.Element, gse_accession: str) -> dict[str, Any]:
         """
