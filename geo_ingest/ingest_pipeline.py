@@ -5,7 +5,7 @@ CLI tool for fetching and storing GEO Series data.
 import argparse
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -14,8 +14,10 @@ from tqdm import tqdm
 from config import settings
 from db import IngestItem, IngestRun, get_db, init_db
 from db.models import GSESeries
+
 from geo_ingest.ncbi_client import NCBIClient
 from geo_ingest.parser import GEOParser
+from mesh.matcher import MeSHMatcher
 from vector.embeddings import get_embedding_provider
 from vector.milvus_store import MilvusStore
 
@@ -50,6 +52,7 @@ class IngestionPipeline:
         mindate: str | None = None,
         maxdate: str | None = None,
         skip_existing: bool = True,
+        progress_callback: Any = None,
     ) -> dict[str, Any]:
         """
         Ingest GEO datasets by search query.
@@ -60,6 +63,7 @@ class IngestionPipeline:
             mindate: Minimum date filter (YYYY/MM/DD)
             maxdate: Maximum date filter (YYYY/MM/DD)
             skip_existing: Skip datasets already in database
+            progress_callback: Optional callback function(stage, current, total, message)
 
         Returns:
             Ingestion statistics dictionary
@@ -69,7 +73,7 @@ class IngestionPipeline:
         # Create ingestion run record
         run = IngestRun(
             query=query,
-            start_time=datetime.utcnow(),
+            start_time=datetime.now(timezone.utc),
             status="running",
             run_metadata={
                 "retmax": retmax,
@@ -82,6 +86,9 @@ class IngestionPipeline:
 
         try:
             # Search for GSE IDs
+            if progress_callback:
+                progress_callback("search", 0, 1, "Searching NCBI for records...")
+            
             gse_ids = self.ncbi_client.search_gse(
                 query=query,
                 retmax=retmax,
@@ -92,22 +99,25 @@ class IngestionPipeline:
             if not gse_ids:
                 logger.warning("No GSE records found")
                 run.status = "completed"
-                run.end_time = datetime.utcnow()
+                run.end_time = datetime.now(timezone.utc)
                 run.total_count = 0
                 self.db.commit()
                 return {"total": 0, "success": 0, "errors": 0, "skipped": 0}
 
-            # Get GSE accessions from IDs
+            # Get GSE accessions from IDs — single batch call, reuse data downstream
             summaries = self.ncbi_client.fetch_gse_summary(gse_ids)
-            accessions = []
+            # Build accession→summary map to avoid re-fetching per record
+            accession_summaries: dict[str, dict] = {}
             for uid, summary in summaries.items():
                 acc = summary.get("accession", "")
                 if acc and acc.startswith("GSE"):
-                    accessions.append(acc)
+                    accession_summaries[acc] = summary
+            accessions = list(accession_summaries.keys())
 
             logger.info(f"Found {len(accessions)} GSE accessions")
 
             # Filter existing if needed
+            skipped_count = 0
             if skip_existing:
                 existing = (
                     self.db.query(GSESeries.accession)
@@ -115,17 +125,21 @@ class IngestionPipeline:
                     .all()
                 )
                 existing_set = {row[0] for row in existing}
+                skipped_count = len(existing_set)
                 accessions = [acc for acc in accessions if acc not in existing_set]
-                logger.info(f"Skipped {len(existing_set)} existing records, processing {len(accessions)}")
+                accession_summaries = {k: v for k, v in accession_summaries.items() if k in accessions}
+                logger.info(f"Skipped {skipped_count} existing records, processing {len(accessions)}")
 
-            run.total_count = len(accessions)
+            run.total_count = len(accessions) + skipped_count
             self.db.commit()
 
-            # Process each accession
-            results = self._process_accessions(run.id, accessions)
+            # Process each accession using pre-fetched summary data
+            results = self._process_accessions(run.id, accessions, progress_callback, accession_summaries)
+            results["skipped"] = skipped_count
+            results["total"] = len(accessions) + skipped_count
 
             # Update run status
-            run.end_time = datetime.utcnow()
+            run.end_time = datetime.now(timezone.utc)
             run.success_count = results["success"]
             run.error_count = results["errors"]
             run.status = "completed" if results["errors"] == 0 else "partial"
@@ -141,7 +155,7 @@ class IngestionPipeline:
         except Exception as e:
             logger.error(f"Ingestion failed: {e}", exc_info=True)
             run.status = "failed"
-            run.end_time = datetime.utcnow()
+            run.end_time = datetime.now(timezone.utc)
             self.db.commit()
             raise
 
@@ -165,7 +179,7 @@ class IngestionPipeline:
         # Create run record
         run = IngestRun(
             query=f"Manual accession list: {', '.join(accessions[:5])}{'...' if len(accessions) > 5 else ''}",
-            start_time=datetime.utcnow(),
+            start_time=datetime.now(timezone.utc),
             status="running",
             run_metadata={"accessions": accessions, "mode": "manual"},
         )
@@ -174,6 +188,7 @@ class IngestionPipeline:
 
         try:
             # Filter existing
+            skipped_count = 0
             if skip_existing:
                 existing = (
                     self.db.query(GSESeries.accession)
@@ -181,15 +196,17 @@ class IngestionPipeline:
                     .all()
                 )
                 existing_set = {row[0] for row in existing}
+                skipped_count = len(existing_set)
                 accessions = [acc for acc in accessions if acc not in existing_set]
-                logger.info(f"Skipped {len(existing_set)} existing, processing {len(accessions)}")
+                logger.info(f"Skipped {skipped_count} existing, processing {len(accessions)}")
 
-            run.total_count = len(accessions)
+            run.total_count = len(accessions) + skipped_count
             self.db.commit()
 
             results = self._process_accessions(run.id, accessions)
+            results["skipped"] = skipped_count
 
-            run.end_time = datetime.utcnow()
+            run.end_time = datetime.now(timezone.utc)
             run.success_count = results["success"]
             run.error_count = results["errors"]
             run.status = "completed" if results["errors"] == 0 else "partial"
@@ -200,46 +217,65 @@ class IngestionPipeline:
         except Exception as e:
             logger.error(f"Ingestion failed: {e}", exc_info=True)
             run.status = "failed"
-            run.end_time = datetime.utcnow()
+            run.end_time = datetime.now(timezone.utc)
             self.db.commit()
             raise
 
-    def _process_accessions(self, run_id: int, accessions: list[str]) -> dict[str, int]:
+    def _process_accessions(
+        self,
+        run_id: int,
+        accessions: list[str],
+        progress_callback: Any = None,
+        prefetched_summaries: dict[str, dict] | None = None,
+    ) -> dict[str, int]:
         """
-        Process list of accessions: fetch, parse, store.
+        Process list of accessions: fetch (or use pre-fetched), parse, store.
+        Embeddings are generated in one batched call at the end for speed.
 
         Args:
             run_id: Ingestion run ID
             accessions: List of GSE accessions
+            progress_callback: Optional callback function(stage, current, total, message)
+            prefetched_summaries: Optional dict of accession→raw summary (avoids re-fetching)
 
         Returns:
             Statistics dictionary
         """
         stats = {"success": 0, "errors": 0, "skipped": 0}
+        total = len(accessions)
 
-        for accession in tqdm(accessions, desc="Processing GSE records"):
+        # Collect parsed records for batch embedding
+        parsed_records: list[tuple[str, dict]] = []  # (accession, parsed)
+
+        for idx, accession in enumerate(tqdm(accessions, desc="Processing GSE records"), 1):
             item = IngestItem(run_id=run_id, accession=accession, status="pending")
             self.db.add(item)
-            self.db.commit()
 
             try:
-                # Fetch
-                item.status = "fetching"
-                self.db.commit()
+                if progress_callback:
+                    progress_callback("process", idx, total, f"Fetching {accession}...")
 
-                raw_data = self.ncbi_client.fetch_gse_text(accession)
-                item.fetch_time = datetime.utcnow()
+                # Use pre-fetched data if available, otherwise make an API call
+                if prefetched_summaries and accession in prefetched_summaries:
+                    raw_data = self.ncbi_client._build_parsed_from_summary(
+                        accession, prefetched_summaries[accession]
+                    )
+                else:
+                    raw_data = self.ncbi_client.fetch_gse_text(accession)
+
+                item.fetch_time = datetime.now(timezone.utc)
 
                 if "error" in raw_data:
                     item.status = "failed"
                     item.error_message = raw_data["error"]
                     self.db.commit()
                     stats["errors"] += 1
+                    if progress_callback:
+                        progress_callback("process", idx, total, f"❌ Error: {accession}")
                     continue
 
-                # Parse
-                item.status = "parsing"
-                self.db.commit()
+                if progress_callback:
+                    progress_callback("process", idx, total, f"Parsing {accession}...")
 
                 parsed = self.parser.parse_gse_metadata(raw_data)
                 if not parsed:
@@ -249,24 +285,21 @@ class IngestionPipeline:
                     stats["errors"] += 1
                     continue
 
-                # Store in database
-                item.status = "storing"
-                self.db.commit()
+                if progress_callback:
+                    progress_callback("process", idx, total, f"Storing {accession}...")
 
                 gse = GSESeries(**parsed)
-                self.db.merge(gse)  # Upsert
-                self.db.commit()
-
-                # Generate and store embedding
-                embedding_text = self.parser.prepare_embedding_text(parsed)
-                embedding = self.embedding_provider.embed_texts([embedding_text])[0]
-                self.vector_store.upsert_embeddings([(accession, embedding)])
-
-                # Success
+                self.db.merge(gse)
                 item.status = "completed"
-                item.process_time = datetime.utcnow()
+                item.process_time = datetime.now(timezone.utc)
+                # Single commit per record (not 7)
                 self.db.commit()
+
+                parsed_records.append((accession, parsed))
                 stats["success"] += 1
+
+                if progress_callback:
+                    progress_callback("process", idx, total, f"✅ Completed: {accession}")
 
             except Exception as e:
                 logger.error(f"Failed to process {accession}: {e}", exc_info=True)
@@ -274,6 +307,33 @@ class IngestionPipeline:
                 item.error_message = str(e)
                 self.db.commit()
                 stats["errors"] += 1
+                if progress_callback:
+                    progress_callback("process", idx, total, f"❌ Error: {accession}")
+
+        # Batch embed all successful records in one call
+        if parsed_records:
+            if progress_callback:
+                progress_callback("process", total, total, f"Generating embeddings for {len(parsed_records)} records...")
+            try:
+                texts = [self.parser.prepare_embedding_text(p) for _, p in parsed_records]
+                embeddings = self.embedding_provider.embed_texts(texts)
+                pairs = [(acc, emb) for (acc, _), emb in zip(parsed_records, embeddings)]
+                self.vector_store.upsert_embeddings(pairs)
+                logger.info(f"Upserted {len(pairs)} embeddings in one batch")
+            except Exception as e:
+                logger.error(f"Batch embedding failed: {e}", exc_info=True)
+
+            # Auto-tag new records with MeSH terms
+            if progress_callback:
+                progress_callback("process", total, total, f"Tagging {len(parsed_records)} records with MeSH terms...")
+            try:
+                new_accessions = [acc for acc, _ in parsed_records]
+                matcher = MeSHMatcher(self.db)
+                n_associations = matcher.tag_gse_batch(new_accessions, confidence_threshold=0.3)
+                logger.info(f"Auto-tagged {len(new_accessions)} records with {n_associations} MeSH associations")
+            except Exception as e:
+                # Non-fatal: MeSH terms may not be loaded yet
+                logger.warning(f"MeSH auto-tagging skipped: {e}")
 
         return stats
 

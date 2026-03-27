@@ -38,8 +38,18 @@ def associate_mesh_terms():
     matcher = MeSHMatcher(db)
 
     total_associations = 0
+    new_associations = 0
+    skipped = 0
+
     for gse in gse_records:
         print(f"\nMatching {gse.accession}: {gse.title[:60]}...")
+
+        # Check if already has associations
+        existing_count = db.query(GSEMesh).filter(GSEMesh.accession == gse.accession).count()
+        if existing_count > 0:
+            print(f"  Skipping (already has {existing_count} associations)")
+            skipped += 1
+            continue
 
         # Match MeSH terms
         matches = matcher.match_gse(gse.accession, confidence_threshold=0.3)
@@ -60,13 +70,16 @@ def associate_mesh_terms():
                     source='auto',
                     confidence=match['confidence']
                 )
-                db.merge(assoc)
+                db.add(assoc)
+            new_associations += len(matches)
             total_associations += len(matches)
         else:
             print(f"  No MeSH matches found")
 
     db.commit()
     db.close()
+
+    print(f"\n✓ Created {new_associations} new GSE-MeSH associations (skipped {skipped} datasets with existing associations)")
 
     print(f"\n✓ Created {total_associations} GSE-MeSH associations")
     return True

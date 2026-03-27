@@ -2,10 +2,30 @@
 import logging
 from typing import Any
 
-from vector.embeddings import get_embedding_provider
+from vector.embeddings import EmbeddingProvider, get_embedding_provider
 from vector.milvus_store import MilvusStore
 
 logger = logging.getLogger(__name__)
+
+# Module-level singletons — loaded once per process, reused on every search call.
+# Avoids reloading the ~90MB sentence-transformer model and reconnecting to
+# Milvus on every request.
+_embedding_provider: EmbeddingProvider | None = None
+_vector_store: MilvusStore | None = None
+
+
+def _get_embedding_provider() -> EmbeddingProvider:
+    global _embedding_provider
+    if _embedding_provider is None:
+        _embedding_provider = get_embedding_provider()
+    return _embedding_provider
+
+
+def _get_vector_store() -> MilvusStore:
+    global _vector_store
+    if _vector_store is None:
+        _vector_store = MilvusStore()
+    return _vector_store
 
 
 def semantic_search(
@@ -31,12 +51,10 @@ def semantic_search(
     """
     logger.info(f"Semantic search: query='{query}', top_k={top_k}")
 
-    # Generate query embedding
-    embedding_provider = get_embedding_provider()
+    embedding_provider = _get_embedding_provider()
     query_embedding = embedding_provider.embed_texts([query])[0]
 
-    # Search in Milvus
-    vector_store = MilvusStore()
+    vector_store = _get_vector_store()
     results = vector_store.search(
         query_vector=query_embedding,
         top_k=top_k,

@@ -151,52 +151,67 @@ class QueryExpander:
         Returns:
             List of matched MeSH term info dictionaries
         """
-        matches = []
+        seen_ids: set[str] = set()
+        matches: list[dict[str, Any]] = []
 
-        # Build search conditions
-        # Look for matches in preferred_name and entry_terms
+        def _add(term: MeshTerm, priority: int) -> None:
+            if term.mesh_id in seen_ids:
+                return
+            seen_ids.add(term.mesh_id)
+            matches.append({
+                "mesh_id": term.mesh_id,
+                "preferred_name": term.preferred_name,
+                "entry_terms": term.entry_terms or [],
+                "descriptor_ui": term.descriptor_ui,
+                "_priority": priority,
+            })
+
+        # Pass 1: exact preferred name match (highest priority)
         for token in tokens:
-            if len(token) < 3:  # Skip very short tokens
+            if len(token) < 3:
                 continue
+            results = self.db.query(MeshTerm).filter(
+                func.lower(MeshTerm.preferred_name) == token.lower()
+            ).all()
+            for t in results:
+                _add(t, 0)
 
-            # Case-insensitive search
-            search_pattern = f"%{token}%"
-
-            # Search in preferred name
-            query = self.db.query(MeshTerm).filter(
-                func.lower(MeshTerm.preferred_name).like(search_pattern)
-            )
-
-            # Also search in entry terms (JSONB array)
-            # Note: This is PostgreSQL-specific
-            query = query.union(
-                self.db.query(MeshTerm).filter(
-                    func.lower(func.cast(MeshTerm.entry_terms, String)).like(search_pattern)
+        # Pass 2: exact entry term match
+        for token in tokens:
+            if len(token) < 3:
+                continue
+            results = self.db.query(MeshTerm).filter(
+                func.lower(func.cast(MeshTerm.entry_terms, String)).like(
+                    f'%"{token.lower()}"%'
                 )
-            )
+            ).limit(max_terms).all()
+            for t in results:
+                _add(t, 1)
 
-            results = query.limit(max_terms).all()
+        # Pass 3: preferred name starts with token (longer tokens only)
+        for token in tokens:
+            if len(token) < 5:
+                continue
+            results = self.db.query(MeshTerm).filter(
+                func.lower(MeshTerm.preferred_name).like(f"{token.lower()}%")
+            ).limit(max_terms).all()
+            for t in results:
+                _add(t, 2)
 
-            for mesh_term in results:
-                # Check if already added
-                if mesh_term.mesh_id in [m["mesh_id"] for m in matches]:
-                    continue
+        # Pass 4: partial preferred name match (fallback)
+        for token in tokens:
+            if len(token) < 5:
+                continue
+            results = self.db.query(MeshTerm).filter(
+                func.lower(MeshTerm.preferred_name).like(f"%{token.lower()}%")
+            ).limit(max_terms).all()
+            for t in results:
+                _add(t, 3)
 
-                matches.append({
-                    "mesh_id": mesh_term.mesh_id,
-                    "preferred_name": mesh_term.preferred_name,
-                    "entry_terms": mesh_term.entry_terms or [],
-                    "descriptor_ui": mesh_term.descriptor_ui,
-                })
-
-                if len(matches) >= max_terms:
-                    break
-
-            if len(matches) >= max_terms:
-                break
-
-        # Sort by relevance (prefer exact matches in preferred name)
-        # For now, just return in order found
+        # Sort by priority then return top max_terms
+        matches.sort(key=lambda x: x["_priority"])
+        for m in matches:
+            m.pop("_priority", None)
         return matches[:max_terms]
 
 
