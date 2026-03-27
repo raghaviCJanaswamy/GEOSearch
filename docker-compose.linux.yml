@@ -1,7 +1,7 @@
 services:
   postgres:
     image: postgres:15-alpine
-    platform: linux/arm64
+    platform: linux/amd64
     container_name: geo_postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
@@ -22,7 +22,7 @@ services:
 
   etcd:
     image: quay.io/coreos/etcd:v3.5.5
-    platform: linux/arm64
+    platform: linux/amd64
     container_name: milvus-etcd
     environment:
       - ETCD_AUTO_COMPACTION_MODE=revision
@@ -44,7 +44,7 @@ services:
 
   minio:
     image: minio/minio:RELEASE.2023-03-20T20-16-18Z
-    platform: linux/arm64
+    platform: linux/amd64
     container_name: milvus-minio
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -67,7 +67,7 @@ services:
 
   milvus:
     image: milvusdb/milvus:v2.3.3
-    platform: linux/arm64
+    platform: linux/amd64
     container_name: milvus-standalone
     command: ["milvus", "run", "standalone"]
     environment:
@@ -107,19 +107,24 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
       POSTGRES_USER: ${POSTGRES_USER:-geouser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
+      # Override POSTGRES_DSN so it uses the Docker service name, not localhost
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-geouser}:${POSTGRES_PASSWORD:-geopass}@postgres:5432/${POSTGRES_DB:-geosearch}
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION_NAME: ${MILVUS_COLLECTION_NAME:-geo_gse_embeddings}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
     depends_on:
       postgres:
         condition: service_healthy
       milvus:
         condition: service_healthy
+
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+
+    # init_database.py uses CREATE TABLE IF NOT EXISTS — safe to run every time
     command: >
       bash -c "
         echo 'Waiting for Postgres to accept connections...' &&
@@ -129,6 +134,7 @@ services:
         echo 'Postgres ready.' &&
         python scripts/init_database.py
       "
+
     restart: "no"
     networks:
       - geosearch-network
@@ -157,7 +163,7 @@ services:
   # Attu — official Milvus GUI (http://localhost:8000)
   attu:
     image: zilliz/attu:v2.3.10
-    platform: linux/arm64
+    platform: linux/amd64
     container_name: milvus-attu
     environment:
       MILVUS_URL: milvus:19530
@@ -184,6 +190,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-geosearch}
       POSTGRES_USER: ${POSTGRES_USER:-geouser}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-geopass}
+      # Override POSTGRES_DSN so it uses the Docker service name, not localhost
       POSTGRES_DSN: postgresql://${POSTGRES_USER:-geouser}:${POSTGRES_PASSWORD:-geopass}@postgres:5432/${POSTGRES_DB:-geosearch}
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
@@ -210,8 +217,10 @@ services:
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
       STREAMLIT_SERVER_HEADLESS: 'true'
       STREAMLIT_SERVER_RUNONSAVE: 'false'
+
     ports:
       - "8501:8501"
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -219,15 +228,18 @@ services:
         condition: service_healthy
       geosearch-init:
         condition: service_completed_successfully
+
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+
     restart: unless-stopped
     networks:
       - geosearch-network
@@ -245,7 +257,7 @@ services:
     networks:
       - geosearch-network
 
-  # GEOSearch FastAPI — REST API (http://localhost:8080)
+  # GEOSearch FastAPI — REST API (http://localhost:8000)
   geosearch-api:
     build:
       context: .
@@ -281,9 +293,12 @@ services:
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
       LLM_MODEL: ${LLM_MODEL:-}
+
     command: uvicorn api:app --host 0.0.0.0 --port 8080 --workers 2
+
     ports:
       - "8080:8080"
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -291,15 +306,18 @@ services:
         condition: service_healthy
       geosearch-init:
         condition: service_completed_successfully
+
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
+
     restart: unless-stopped
     networks:
       - geosearch-network
