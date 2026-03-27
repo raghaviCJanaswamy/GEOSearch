@@ -85,16 +85,18 @@ def load_mesh_from_xml(file_path: str, db: Session) -> int:
 
         batch.append(mesh_term)
 
-        # Commit in batches
+        # Commit in batches using merge (upsert) to handle re-runs
         if len(batch) >= batch_size:
-            db.bulk_save_objects(batch)
+            for obj in batch:
+                db.merge(obj)
             db.commit()
             count += len(batch)
             batch = []
 
     # Commit remaining
     if batch:
-        db.bulk_save_objects(batch)
+        for obj in batch:
+            db.merge(obj)
         db.commit()
         count += len(batch)
 

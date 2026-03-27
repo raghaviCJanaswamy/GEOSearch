@@ -7,7 +7,8 @@ import re
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, and_, func, or_
+from sqlalchemy import String, and_, cast, func, or_, text
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Session
 
 from config import settings
@@ -150,7 +151,8 @@ class HybridSearchEngine:
         top_k: int,
     ) -> list[dict[str, Any]]:
         """
-        Perform lexical/keyword search using PostgreSQL.
+        Perform lexical/keyword search using PostgreSQL full-text search.
+        Uses tsvector/tsquery which is index-backed and far faster than LIKE.
 
         Args:
             query: Search query
@@ -160,51 +162,43 @@ class HybridSearchEngine:
         Returns:
             List of results with accession and relevance score
         """
-        # Build search conditions
-        search_terms = query.lower().split()
+        # Convert query to a PostgreSQL websearch tsquery (handles phrases, AND, OR)
+        # Falls back to plain to_tsquery if empty after stripping short tokens
+        tsquery = func.websearch_to_tsquery("english", query)
 
-        conditions = []
-        for term in search_terms:
-            if len(term) < 3:
-                continue
-
-            term_pattern = f"%{term}%"
-            conditions.append(
-                or_(
-                    func.lower(GSESeries.title).like(term_pattern),
-                    func.lower(GSESeries.summary).like(term_pattern),
-                    func.lower(GSESeries.overall_design).like(term_pattern),
-                )
+        # Build a weighted tsvector over title (A), summary (B), overall_design (C)
+        # setweight gives title matches a higher rank than summary matches
+        tsvec = func.setweight(
+            func.to_tsvector("english", func.coalesce(GSESeries.title, "")), "A"
+        ).op("||")(
+            func.setweight(
+                func.to_tsvector("english", func.coalesce(GSESeries.summary, "")), "B"
             )
+        ).op("||")(
+            func.setweight(
+                func.to_tsvector("english", func.coalesce(GSESeries.overall_design, "")), "C"
+            )
+        )
 
-        if not conditions:
-            return []
-
-        # Combine with OR (match any term)
-        combined_condition = or_(*conditions)
+        ts_rank = func.ts_rank(tsvec, tsquery)
+        ts_match = tsvec.op("@@")(tsquery)
 
         # Apply filters
         filter_conditions = self._build_filter_conditions(filters)
-        if filter_conditions:
-            combined_condition = and_(combined_condition, *filter_conditions)
+        base_filter = and_(ts_match, *filter_conditions) if filter_conditions else ts_match
 
-        # Execute query
         results = (
-            self.db.query(GSESeries.accession)
-            .filter(combined_condition)
+            self.db.query(GSESeries.accession, ts_rank.label("rank"))
+            .filter(base_filter)
+            .order_by(ts_rank.desc())
             .limit(top_k)
             .all()
         )
 
-        # Format results (simple scoring based on order)
-        formatted = []
-        for idx, (accession,) in enumerate(results):
-            formatted.append({
-                "accession": accession,
-                "score": 1.0 / (idx + 1),  # Simple relevance score
-            })
-
-        return formatted
+        return [
+            {"accession": accession, "score": float(rank)}
+            for accession, rank in results
+        ]
 
     def _build_filter_conditions(self, filters: dict[str, Any]) -> list[Any]:
         """
@@ -355,15 +349,33 @@ class HybridSearchEngine:
         if not ranked_accessions:
             return []
 
-        # Fetch GSE records
+        # Fetch GSE records in one query
         gse_records = (
             self.db.query(GSESeries)
             .filter(GSESeries.accession.in_(ranked_accessions))
             .all()
         )
-
-        # Create lookup
         gse_lookup = {gse.accession: gse for gse in gse_records}
+
+        # Fetch all MeSH associations for all accessions in one batched query
+        # instead of one query per result (avoids N+1)
+        mesh_by_accession: dict[str, list[dict]] = {}
+        if matched_mesh_ids:
+            all_mesh_assocs = (
+                self.db.query(GSEMesh, MeshTerm)
+                .join(MeshTerm, GSEMesh.mesh_id == MeshTerm.mesh_id)
+                .filter(
+                    GSEMesh.accession.in_(ranked_accessions),
+                    GSEMesh.mesh_id.in_(matched_mesh_ids),
+                )
+                .all()
+            )
+            for assoc, term in all_mesh_assocs:
+                mesh_by_accession.setdefault(assoc.accession, []).append({
+                    "mesh_id": assoc.mesh_id,
+                    "preferred_name": term.preferred_name,
+                    "confidence": assoc.confidence,
+                })
 
         # Apply filters and format results
         results = []
@@ -373,38 +385,14 @@ class HybridSearchEngine:
 
             gse = gse_lookup[accession]
 
-            # Apply filters
             if not self._passes_filters(gse, filters):
                 continue
 
-            # Get matched MeSH terms for this dataset
-            matched_mesh = []
-            if matched_mesh_ids:
-                mesh_assocs = (
-                    self.db.query(GSEMesh, MeshTerm)
-                    .join(MeshTerm, GSEMesh.mesh_id == MeshTerm.mesh_id)
-                    .filter(
-                        GSEMesh.accession == accession,
-                        GSEMesh.mesh_id.in_(matched_mesh_ids),
-                    )
-                    .all()
-                )
-                matched_mesh = [
-                    {
-                        "mesh_id": assoc.mesh_id,
-                        "preferred_name": term.preferred_name,
-                        "confidence": assoc.confidence,
-                    }
-                    for assoc, term in mesh_assocs
-                ]
-
-            # Format result
             result = {
                 **gse.to_dict(),
-                "matched_mesh_terms": matched_mesh,
+                "matched_mesh_terms": mesh_by_accession.get(accession, []),
                 "geo_url": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",
             }
-
             results.append(result)
 
             if len(results) >= top_k:
