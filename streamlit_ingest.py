@@ -73,10 +73,10 @@ def show_query_ingestion() -> None:
     # Quick ingest presets
     st.markdown("### Quick Start")
     quick_presets = {
-        "🔬 Cancer Research": {"query": "cancer", "retmax": 50},
-        "🧬 RNA-seq": {"query": "RNA-seq", "retmax": 50},
-        "🦠 COVID-19": {"query": "COVID-19", "retmax": 50},
-        "🧠 Brain": {"query": "brain", "retmax": 50},
+        "🔬 Cancer Research": {"query": "cancer", "retmax": 10},
+        "🧬 RNA-seq": {"query": "RNA-seq", "retmax": 10},
+        "🦠 COVID-19": {"query": "COVID-19", "retmax": 10},
+        "🧠 Brain": {"query": "brain", "retmax": 10},
     }
 
     col1, col2, col3, col4 = st.columns(4)
