@@ -17,9 +17,15 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # --- Pre-download embedding model so it is baked into the image ---
 # This avoids a ~90MB runtime download on every cold start.
+# HF_HUB_OFFLINE=1 at download time caches the model to the default HF cache dir.
+ENV HF_HUB_OFFLINE=0
 RUN python -c "\
 from sentence_transformers import SentenceTransformer; \
 SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
+
+# At runtime, use the baked-in cache — never phone home to HuggingFace.
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
 
 # --- Application code (changes frequently — kept last to preserve cache above) ---
 COPY . .

@@ -14,7 +14,10 @@ from config import settings
 from db import IngestRun, get_db, engine, init_db
 from db.models import GSESeries, MeshTerm, IngestRun as IngestRunModel
 from geo_ingest.ingest_pipeline import IngestionPipeline
+from geo_ingest.parser import GEOParser
 from streamlit_ingest_mesh import show_mesh_loader
+from vector.embeddings import get_embedding_provider
+from vector.milvus_store import MilvusStore
 
 logger = logging.getLogger(__name__)
 
@@ -46,130 +49,287 @@ def show_ingestion_interface() -> None:
         )
 
     # Create tabs for different ingestion methods
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🔍 Query Search", "📋 Ingestion History", "⚙️ Configuration", "🗄️ Database"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["🔍 Query Search", "📂 File Import", "📋 Ingestion History", "⚙️ Configuration", "🗄️ Database"]
     )
 
     with tab1:
         show_query_ingestion()
 
     with tab2:
+        show_file_import()
+
+    with tab3:
         if db_available:
             show_ingestion_history()
         else:
             st.info("Ingestion history will be available once database is ready.")
 
-    with tab3:
-        show_ingestion_config()
-    
     with tab4:
+        show_ingestion_config()
+
+    with tab5:
         show_database_initialization()
+
+
+ORGANISM_OPTIONS = [
+    "Any",
+    "Homo sapiens",
+    "Mus musculus",
+    "Rattus norvegicus",
+    "Drosophila melanogaster",
+    "Caenorhabditis elegans",
+    "Danio rerio",
+    "Arabidopsis thaliana",
+    "Saccharomyces cerevisiae",
+]
 
 
 def show_query_ingestion() -> None:
     """Show interface for ingesting by search query."""
     st.subheader("Search and Ingest")
 
-    # Quick ingest presets
-    st.markdown("### Quick Start")
-    quick_presets = {
-        "🔬 Cancer Research": {"query": "cancer", "retmax": 10},
-        "🧬 RNA-seq": {"query": "RNA-seq", "retmax": 10},
-        "🦠 COVID-19": {"query": "COVID-19", "retmax": 10},
-        "🧠 Brain": {"query": "brain", "retmax": 10},
-    }
+    cq_col1, cq_col2 = st.columns([3, 1])
+    with cq_col1:
+        query = st.text_input(
+            "Search Query",
+            placeholder="e.g., 'breast cancer RNA-seq' or 'melanoma microarray'",
+            help="Enter your NCBI search query",
+        )
+    with cq_col2:
+        organism = st.selectbox("Species", options=ORGANISM_OPTIONS, index=0, key="cq_organism")
 
     col1, col2, col3, col4 = st.columns(4)
-    quick_cols = [col1, col2, col3, col4]
-
-    for idx, (label, params) in enumerate(quick_presets.items()):
-        with quick_cols[idx]:
-            if st.button(label, use_container_width=True, key=f"quick_{idx}"):
-                ingest_with_progress(
-                    query=params["query"],
-                    retmax=params["retmax"],
-                    skip_existing=True,
-                )
-                st.rerun()
-
-    st.markdown("---")
-
-    # Custom query input
-    st.markdown("### Custom Query")
-    query = st.text_input(
-        "Search Query",
-        placeholder="e.g., 'breast cancer RNA-seq' or 'melanoma microarray'",
-        help="Enter your NCBI search query",
-    )
-
-    # Advanced options
-    col1, col2 = st.columns(2)
-
     with col1:
         retmax = st.number_input(
-            "Number of Results",
-            min_value=1,
-            max_value=10000,
-            value=50,
-            step=10,
-            help="Maximum number of GEO records to fetch",
+            "Max Results", min_value=1, max_value=10000, value=50, step=10,
         )
-
     with col2:
-        skip_existing = st.checkbox(
-            "Skip Existing Records",
-            value=True,
-            help="Don't re-ingest datasets already in database",
-        )
+        skip_existing = st.checkbox("Skip Existing", value=True)
+    with col3:
+        mindate = st.date_input("From Date", value=None)
+    with col4:
+        maxdate = st.date_input("To Date", value=None)
 
-    # Date range filter (optional)
-    st.markdown("**Date Range (Optional)**")
-    date_col1, date_col2 = st.columns(2)
-
-    with date_col1:
-        mindate = st.date_input(
-            "From Date",
-            value=None,
-            help="Leave empty to ignore",
-        )
-
-    with date_col2:
-        maxdate = st.date_input(
-            "To Date",
-            value=None,
-            help="Leave empty to ignore",
-        )
-
-    # Format dates for NCBI API
     mindate_str = mindate.strftime("%Y/%m/%d") if mindate else None
     maxdate_str = maxdate.strftime("%Y/%m/%d") if maxdate else None
 
-    # Start ingestion button
     if st.button("🚀 Start Ingestion", type="primary", use_container_width=True):
         if not query:
             st.error("Please enter a search query")
             return
 
-        # Check database before starting
         try:
             db_test = next(get_db())
             db_test.close()
         except Exception as e:
-            st.error(
-                f"Cannot start ingestion: Database not ready\n\n"
-                f"Error: {str(e)}\n\n"
-                f"**Please wait**: The system is initializing PostgreSQL.\n"
-                f"Refresh the page in 30-60 seconds."
-            )
+            st.error(f"Cannot start ingestion: Database not ready\n\nError: {str(e)}")
             return
 
+        full_query = query
+        if organism != "Any":
+            full_query = f"{query} AND {organism}[Organism]"
+
         ingest_with_progress(
-            query=query,
+            query=full_query,
             retmax=retmax,
             mindate=mindate_str,
             maxdate=maxdate_str,
             skip_existing=skip_existing,
         )
+
+
+def _parse_txt_records(content: str) -> list[dict]:
+    """Parse gds_result_summary.txt content into raw record dicts."""
+    import re
+    blocks = re.split(r"\n(?=\d+\.\s)", content.strip())
+    records = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        title = re.sub(r"^\d+\.\s*", "", lines[0]).strip() if lines else ""
+        summary = ""
+        for line in lines[1:]:
+            if line.startswith("(Submitter supplied)"):
+                summary = re.sub(r"^\(Submitter supplied\)\s*", "", line).strip().rstrip(" more...")
+                break
+        organism = ""
+        for line in lines:
+            m = re.match(r"Organism:\s*(.+)", line)
+            if m:
+                organism = m.group(1).strip()
+                break
+        tech_type_raw = ""
+        for line in lines:
+            m = re.match(r"Type:\s*(.+)", line)
+            if m:
+                tech_type_raw = m.group(1).strip()
+                break
+        platforms, sample_count = [], None
+        for line in lines:
+            m = re.match(r"Platform:\s*(.+)", line)
+            if m:
+                ps = m.group(1).strip()
+                for part in ps.split():
+                    if part.startswith("GPL") and part[3:].isdigit():
+                        platforms.append(int(part[3:]))
+                cm = re.search(r"(\d+)\s+Samples?", ps, re.IGNORECASE)
+                if cm:
+                    sample_count = int(cm.group(1))
+                break
+        accession = ""
+        for line in lines:
+            m = re.search(r"Accession:\s*(GSE\d+)", line)
+            if m:
+                accession = m.group(1).strip()
+                break
+        if not accession:
+            continue
+        records.append({
+            "accession": accession,
+            "title": title,
+            "summary": summary,
+            "overall_design": "",
+            "organisms": [organism] if organism else [],
+            "tech_type_raw": tech_type_raw,
+            "platforms": platforms,
+            "sample_count": sample_count,
+            "submission_date": None,
+            "pubmed_ids": [],
+        })
+    return records
+
+
+def show_file_import() -> None:
+    """Upload a GEO summary txt file and import into DB + Milvus."""
+    st.subheader("Import from File")
+    st.caption("Upload a GEO summary text file (e.g. gds_result_summary.txt) downloaded from NCBI.")
+
+    uploaded = st.file_uploader("Choose a .txt file", type=["txt"], key="geo_txt_upload")
+    skip_existing = st.checkbox("Skip records already in database", value=True, key="file_import_skip")
+
+    if uploaded is None:
+        st.info("Download a summary file from NCBI GEO search results, then upload it here.")
+        return
+
+    content = uploaded.read().decode("utf-8", errors="replace")
+    records = _parse_txt_records(content)
+
+    import re
+    total_blocks = len(re.split(r"\n(?=\d+\.\s)", content.strip()))
+    gsm_count = total_blocks - len(records)
+
+    if not records:
+        st.error("No records found in file — check the file format.")
+        return
+
+    st.success(
+        f"Found **{total_blocks} total entries** in `{uploaded.name}`:  \n"
+        f"- **{len(records)} GSE Series** (study-level datasets — these will be imported)  \n"
+        f"- **{gsm_count} GSM Samples** (individual samples — skipped, already covered by their GSE Series)"
+    )
+
+    with st.expander("Preview records", expanded=False):
+        for r in records[:5]:
+            st.markdown(f"**{r['accession']}** — {r['title'][:80]}")
+            st.caption(f"Organism: {', '.join(r['organisms']) or 'N/A'} | Samples: {r['sample_count']} | Type: {r['tech_type_raw'][:50]}")
+
+    if st.button("Import into Database", type="primary", use_container_width=True, key="file_import_btn"):
+        try:
+            db = next(get_db())
+        except Exception as e:
+            st.error(f"Database not ready: {e}")
+            return
+
+        parser = GEOParser()
+        embedding_provider = get_embedding_provider()
+        vector_store = MilvusStore()
+
+        run = IngestRun(
+            query=f"txt_import:{uploaded.name}",
+            start_time=datetime.utcnow(),
+            status="running",
+            run_metadata={"source_file": uploaded.name, "total": len(records)},
+        )
+        db.add(run)
+        db.commit()
+
+        # Filter existing
+        skipped = 0
+        to_process = records
+        if skip_existing:
+            existing = {
+                row[0] for row in db.query(GSESeries.accession)
+                .filter(GSESeries.accession.in_([r["accession"] for r in records]))
+                .all()
+            }
+            to_process = [r for r in records if r["accession"] not in existing]
+            skipped = len(records) - len(to_process)
+
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        mc1, mc2, mc3 = st.columns(3)
+        success_ph = mc1.empty()
+        error_ph = mc2.empty()
+        skip_ph = mc3.empty()
+
+        success, errors = 0, 0
+        parsed_for_embed: list[tuple[str, dict]] = []
+        total = len(to_process)
+
+        for i, raw in enumerate(to_process, 1):
+            status_text.info(f"Processing {raw['accession']} ({i}/{total})...")
+            progress_bar.progress(int(i / max(total, 1) * 80))
+            try:
+                parsed = parser.parse_gse_metadata(raw)
+                if not parsed:
+                    errors += 1
+                    continue
+                db.merge(GSESeries(**parsed))
+                db.commit()
+                parsed_for_embed.append((raw["accession"], parsed))
+                success += 1
+            except Exception as e:
+                db.rollback()
+                errors += 1
+                logger.error(f"Failed {raw['accession']}: {e}")
+
+            success_ph.metric("Stored", success)
+            error_ph.metric("Errors", errors)
+            skip_ph.metric("Skipped", skipped)
+
+        # Embeddings
+        if parsed_for_embed:
+            status_text.info(f"Generating embeddings for {len(parsed_for_embed)} records...")
+            try:
+                texts = [parser.prepare_embedding_text(p) for _, p in parsed_for_embed]
+                embeddings = embedding_provider.embed_texts(texts)
+                vectors = [
+                    {"accession": acc, "embedding": emb}
+                    for (acc, _), emb in zip(parsed_for_embed, embeddings)
+                    if emb is not None
+                ]
+                if vectors:
+                    vector_store.upsert(vectors)
+            except Exception as e:
+                st.warning(f"Embeddings failed: {e}")
+
+        progress_bar.progress(100)
+
+        run.end_time = datetime.utcnow()
+        run.total_count = len(records)
+        run.success_count = success
+        run.error_count = errors
+        run.status = "completed" if errors == 0 else "partial"
+        db.commit()
+        db.close()
+
+        if success > 0:
+            status_text.success(f"Done! {success} records imported, {errors} errors, {skipped} skipped.")
+        else:
+            status_text.warning(f"No new records imported. {errors} errors, {skipped} skipped.")
 
 
 def ingest_with_progress(

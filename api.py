@@ -25,7 +25,7 @@ from search.hybrid_search import HybridSearchEngine
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="GEOSearch API",
+    title="GEO Smart Search -  API",
     description="AI-powered semantic search over NCBI GEO dataset metadata.",
     version="1.0.0",
 )
