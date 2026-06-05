@@ -135,7 +135,7 @@ services:
 
   # pgAdmin — PostgreSQL GUI (http://localhost:5050)
   pgadmin:
-    image: dpage/pgadmin4:latest
+    image: dpage/pgadmin4:9.15
     container_name: geo_pgadmin
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@geosearch.com

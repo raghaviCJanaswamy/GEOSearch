@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # MeSH XML download URL (2024 version - latest available)
 # See: https://nlmpubs.nlm.nih.gov/projects/mesh/2024/xmlmesh/
-MESH_XML_URL = "https://nlmpubs.nlm.nih.gov/projects/mesh/2024/xmlmesh/desc2024.xml"
+MESH_XML_URL = "https://nlmpubs.nlm.nih.gov/projects/mesh/2024/xmlmesh/desc2026.xml"
 
 
 def download_mesh_xml(output_path: str, force: bool = False) -> str:
