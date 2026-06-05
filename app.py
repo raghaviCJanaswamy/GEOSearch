@@ -129,24 +129,18 @@ def perform_search(
     tech_type: str | None,
     date_start: datetime | None,
     date_end: datetime | None,
-    min_samples: int | None,
     use_semantic: bool,
     use_lexical: bool,
     use_mesh: bool,
-    top_k: int,
 ) -> dict[str, Any]:
-    """Perform search with caching."""
+    """Perform search with caching. Returns all matched results for client-side pagination."""
     db = SessionLocal()
 
-    # Build filters
     filters = {}
-
     if organisms:
         filters["organisms"] = organisms
-
     if tech_type and tech_type != "All":
         filters["tech_type"] = tech_type
-
     if date_start or date_end:
         filters["date_range"] = {}
         if date_start:
@@ -154,11 +148,7 @@ def perform_search(
         if date_end:
             filters["date_range"]["end"] = date_end
 
-    if min_samples and min_samples > 0:
-        filters["min_samples"] = min_samples
-
     try:
-        # Perform search
         engine = HybridSearchEngine(db)
         results = engine.search(
             query=query,
@@ -166,7 +156,6 @@ def perform_search(
             use_semantic=use_semantic,
             use_lexical=use_lexical,
             use_mesh=use_mesh,
-            top_k=top_k,
         )
     finally:
         db.close()
@@ -370,9 +359,8 @@ def main() -> None:
     use_semantic = st.sidebar.checkbox("Semantic", value=True, help="AI vector similarity")
     use_lexical  = st.sidebar.checkbox("Keyword",  value=True, help="Full-text search")
     use_mesh     = st.sidebar.checkbox("MeSH",     value=True, help="Medical synonym expansion")
-    top_k = st.sidebar.slider("Results", min_value=10, max_value=200, value=50, step=10)
 
-    st.header("GEO Dataset Smart Search")
+    st.header("GEO: AI based Biomedical Datasets Discovery")
 
     col_q, col_s = st.columns([7, 1])
     with col_q:
@@ -394,11 +382,9 @@ def main() -> None:
                     tech_type=tech_type if tech_type != "All" else None,
                     date_start=datetime.combine(date_start, datetime.min.time()) if date_start else None,
                     date_end=datetime.combine(date_end, datetime.max.time()) if date_end else None,
-                    min_samples=None,
                     use_semantic=use_semantic,
                     use_lexical=use_lexical,
                     use_mesh=use_mesh,
-                    top_k=top_k,
                 )
                 st.session_state["_results"] = results
                 st.session_state["_search_query"] = query
@@ -423,8 +409,7 @@ def main() -> None:
         metadata = results["metadata"]
         result_list = results["results"]
 
-        # Display search metadata
-        st.caption(f"Found {metadata['total_results']} results")
+        # Display search metadata — shown after pagination is computed below
 
         # Show MeSH expansion
         if saved_use_mesh and metadata.get("mesh_terms"):
@@ -440,7 +425,7 @@ def main() -> None:
                 st.markdown(mesh_html, unsafe_allow_html=True)
 
         if result_list:
-            PAGE_SIZE = 10
+            PAGE_SIZE = 20
             total = len(result_list)
             total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
@@ -451,29 +436,95 @@ def main() -> None:
             start = (page - 1) * PAGE_SIZE
             end = min(start + PAGE_SIZE, total)
 
-            st.markdown(
-                f"**{total} results** &nbsp;·&nbsp; page {page} of {total_pages}",
-                unsafe_allow_html=True,
-            )
+            # NCBI-style header + download buttons on the same row
+            hdr_col, dl_col1, dl_col2 = st.columns([6, 1.2, 1.2])
+            with hdr_col:
+                st.markdown(
+                    f'<div style="font-size:0.9em;color:#444;margin-bottom:6px;">'
+                    f'Items: <b>{start+1}</b> to <b>{end}</b> of <b>{total}</b>'
+                    f'&nbsp;&nbsp;|&nbsp;&nbsp;Page {page} of {total_pages}'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            with dl_col1:
+                gse_list = "\n".join(r["accession"] for r in result_list)
+                st.download_button(
+                    label="⬇ GSE IDs (.txt)",
+                    data=gse_list,
+                    file_name=f"geosearch_{saved_query.replace(' ', '_')[:30]}.txt",
+                    mime="text/plain",
+                    use_container_width=True,
+                    key="dl_txt",
+                )
+            with dl_col2:
+                import csv, io
+                csv_buf = io.StringIO()
+                writer = csv.writer(csv_buf)
+                writer.writerow(["accession", "title", "organisms", "tech_type", "sample_count", "submission_date", "geo_url"])
+                for r in result_list:
+                    writer.writerow([
+                        r.get("accession", ""),
+                        r.get("title", ""),
+                        "; ".join(r.get("organisms") or []),
+                        r.get("tech_type", ""),
+                        r.get("sample_count", ""),
+                        (r.get("submission_date") or "")[:10],
+                        r.get("geo_url", ""),
+                    ])
+                st.download_button(
+                    label="⬇ Full CSV",
+                    data=csv_buf.getvalue(),
+                    file_name=f"geosearch_{saved_query.replace(' ', '_')[:30]}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="dl_csv",
+                )
+
+            # Top pagination controls
+            pc1, pc2, pc3, pc4, pc5 = st.columns([1, 1, 4, 1, 1])
+            with pc1:
+                if st.button("« First", disabled=page <= 1, use_container_width=True, key="first_top"):
+                    st.session_state.page = 1
+                    st.rerun()
+            with pc2:
+                if st.button("‹ Prev", disabled=page <= 1, use_container_width=True, key="prev_top"):
+                    st.session_state.page -= 1
+                    st.rerun()
+            with pc4:
+                if st.button("Next ›", disabled=page >= total_pages, use_container_width=True, key="next_top"):
+                    st.session_state.page += 1
+                    st.rerun()
+            with pc5:
+                if st.button("Last »", disabled=page >= total_pages, use_container_width=True, key="last_top"):
+                    st.session_state.page = total_pages
+                    st.rerun()
 
             for result in result_list[start:end]:
                 render_result_card(result)
 
-            # Pagination controls
-            col_prev, col_info, col_next = st.columns([1, 4, 1])
-            with col_prev:
-                if st.button("← Prev", disabled=page <= 1, use_container_width=True):
+            # Bottom pagination controls
+            bc1, bc2, bc3, bc4, bc5 = st.columns([1, 1, 4, 1, 1])
+            with bc1:
+                if st.button("« First", disabled=page <= 1, use_container_width=True, key="first_bot"):
+                    st.session_state.page = 1
+                    st.rerun()
+            with bc2:
+                if st.button("‹ Prev", disabled=page <= 1, use_container_width=True, key="prev_bot"):
                     st.session_state.page -= 1
                     st.rerun()
-            with col_info:
+            with bc3:
                 st.markdown(
-                    f'<div style="text-align:center;font-size:0.85em;color:#666;">'
-                    f'Showing {start+1}–{end} of {total}</div>',
+                    f'<div style="text-align:center;font-size:0.85em;color:#666;padding-top:8px;">'
+                    f'Items {start+1}–{end} of {total}</div>',
                     unsafe_allow_html=True,
                 )
-            with col_next:
-                if st.button("Next →", disabled=page >= total_pages, use_container_width=True):
+            with bc4:
+                if st.button("Next ›", disabled=page >= total_pages, use_container_width=True, key="next_bot"):
                     st.session_state.page += 1
+                    st.rerun()
+            with bc5:
+                if st.button("Last »", disabled=page >= total_pages, use_container_width=True, key="last_bot"):
+                    st.session_state.page = total_pages
                     st.rerun()
         else:
             st.warning("No results found. Try adjusting your search query or filters.")
