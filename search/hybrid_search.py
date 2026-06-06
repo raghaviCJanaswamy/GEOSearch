@@ -92,7 +92,11 @@ class HybridSearchEngine:
                 semantic_results = semantic_search(
                     query=expanded_query,
                     top_k=settings.semantic_top_k,
+<<<<<<< HEAD
                     min_score=0.62,
+=======
+                    min_score=0.65,
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
                 )
                 # If too few results, the query may be a lay term whose embedding
                 # lands far from clinical vocabulary — relax threshold to recover recall
@@ -218,15 +222,20 @@ class HybridSearchEngine:
             except Exception:
                 pass  # fallback: skip expansion if tsquery syntax fails
 
+<<<<<<< HEAD
         # OR in each MeSH preferred name as a whole phrase.
         # This is critical for lay-term queries like "heart attack" where the original
         # words don't appear in clinical papers — the MeSH terms drive lexical recall.
+=======
+        # OR in each MeSH preferred name as a whole phrase
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
         for mt in (mesh_terms or []):
             mt_cleaned = mt.strip("\"'(),.")
             if len(mt_cleaned) >= 3:
                 combined_tsquery = combined_tsquery.op("||")(
                     func.plainto_tsquery("english", mt_cleaned)
                 )
+<<<<<<< HEAD
                 # Also add prefix variant of first word of multi-word MeSH terms
                 # e.g. "Myocardial Infarction" → "myocard:*" catches myocardial/myocardium
                 mt_words = mt_cleaned.split()
@@ -238,6 +247,8 @@ class HybridSearchEngine:
                         )
                     except Exception:
                         pass
+=======
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
 
         ts_rank = func.ts_rank(tsvec, combined_tsquery)
         ts_match = tsvec.op("@@")(combined_tsquery)
