@@ -93,7 +93,11 @@ class HybridSearchEngine:
                     query=expanded_query,
                     top_k=settings.semantic_top_k,
 <<<<<<< HEAD
+<<<<<<< HEAD
                     min_score=0.62,
+=======
+                    min_score=0.65,
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
 =======
                     min_score=0.65,
 >>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
@@ -223,9 +227,13 @@ class HybridSearchEngine:
                 pass  # fallback: skip expansion if tsquery syntax fails
 
 <<<<<<< HEAD
+<<<<<<< HEAD
         # OR in each MeSH preferred name as a whole phrase.
         # This is critical for lay-term queries like "heart attack" where the original
         # words don't appear in clinical papers — the MeSH terms drive lexical recall.
+=======
+        # OR in each MeSH preferred name as a whole phrase
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
 =======
         # OR in each MeSH preferred name as a whole phrase
 >>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
@@ -235,6 +243,7 @@ class HybridSearchEngine:
                 combined_tsquery = combined_tsquery.op("||")(
                     func.plainto_tsquery("english", mt_cleaned)
                 )
+<<<<<<< HEAD
 <<<<<<< HEAD
                 # Also add prefix variant of first word of multi-word MeSH terms
                 # e.g. "Myocardial Infarction" → "myocard:*" catches myocardial/myocardium
@@ -247,6 +256,8 @@ class HybridSearchEngine:
                         )
                     except Exception:
                         pass
+=======
+>>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
 =======
 >>>>>>> 985a8548368658b3cf9f466a5da04f02ed4667b6
 
