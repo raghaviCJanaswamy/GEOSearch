@@ -39,8 +39,8 @@ class Settings(BaseSettings):
 
     # Embeddings
     embedding_provider: Literal["local", "openai"] = "local"
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    embedding_dimension: int = 384
+    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    embedding_dimension: int = 768
 
     # OpenAI
     openai_api_key: str | None = None

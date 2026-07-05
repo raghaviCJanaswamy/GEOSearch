@@ -22,47 +22,72 @@ class MeSHMatcher:
 
     # Class-level cache so MeSH terms are only loaded once per process
     _term_lookup_cache: dict[str, list[str]] | None = None
+    _single_lookup_cache: dict[str, list[tuple[str, float]]] | None = None
+    _phrase_by_first_word_cache: dict[str, dict[str, list[str]]] | None = None
 
     def __init__(self, db: Session):
-        """
-        Initialize matcher.
-
-        Args:
-            db: Database session
-        """
         self.db = db
-
-        # Load MeSH terms into memory for faster matching (cached at class level)
         if MeSHMatcher._term_lookup_cache is None:
             self._load_mesh_terms()
-        self.term_lookup = MeSHMatcher._term_lookup_cache
+        self.term_lookup          = MeSHMatcher._term_lookup_cache
+        self.single_lookup        = MeSHMatcher._single_lookup_cache
+        self.phrase_by_first_word = MeSHMatcher._phrase_by_first_word_cache
 
     def _load_mesh_terms(self) -> None:
-        """Load all MeSH terms from database into class-level cache."""
+        """Load MeSH terms into two structures for fast matching:
+        - term_lookup: exact phrase -> [mesh_id]  (for substring search)
+        - single_lookup: single_word -> [(mesh_id, confidence)]  (for token lookup)
+        """
         logger.info("Loading MeSH terms for matching...")
-
         terms = self.db.query(MeshTerm).all()
 
-        # Build lookup dictionary: term_text -> mesh_id
         term_lookup: dict[str, list[str]] = {}
+        # single-word token index: word -> list of (mesh_id, base_confidence)
+        single_lookup: dict[str, list[tuple[str, float]]] = {}
 
         for term in terms:
-            # Add preferred name
-            preferred = term.preferred_name.lower()
-            if preferred not in term_lookup:
-                term_lookup[preferred] = []
-            term_lookup[preferred].append(term.mesh_id)
-
-            # Add entry terms (synonyms)
+            all_names = [term.preferred_name]
             if term.entry_terms:
-                for entry in term.entry_terms:
-                    entry_lower = entry.lower()
-                    if entry_lower not in term_lookup:
-                        term_lookup[entry_lower] = []
-                    term_lookup[entry_lower].append(term.mesh_id)
+                all_names.extend(term.entry_terms)
+
+            for name in all_names:
+                name_lower = name.lower().strip()
+                if len(name_lower) < 4:
+                    continue
+                words = name_lower.split()
+                n = len(words)
+
+                # Store full phrase for substring matching
+                if name_lower not in term_lookup:
+                    term_lookup[name_lower] = []
+                term_lookup[name_lower].append(term.mesh_id)
+
+                # For single-word terms, also index by the word token
+                if n == 1 and len(name_lower) >= 5:
+                    if name_lower not in single_lookup:
+                        single_lookup[name_lower] = []
+                    single_lookup[name_lower].append((term.mesh_id, 0.4))
+
+        # Build first-word index for multi-word phrases only
+        phrase_by_first_word: dict[str, dict[str, list[str]]] = {}
+        for phrase, mesh_ids in term_lookup.items():
+            if " " not in phrase:
+                continue  # single-word handled by single_lookup
+            first = phrase.split()[0]
+            if len(first) < 4:
+                continue
+            if first not in phrase_by_first_word:
+                phrase_by_first_word[first] = {}
+            phrase_by_first_word[first][phrase] = mesh_ids
 
         MeSHMatcher._term_lookup_cache = term_lookup
-        logger.info(f"Loaded {len(terms)} MeSH terms with {len(term_lookup)} searchable variants")
+        MeSHMatcher._single_lookup_cache = single_lookup
+        MeSHMatcher._phrase_by_first_word_cache = phrase_by_first_word
+        logger.info(
+            f"Loaded {len(terms)} MeSH terms: "
+            f"{len(term_lookup)} phrase variants, {len(single_lookup)} single-word tokens, "
+            f"{len(phrase_by_first_word)} first-word index entries"
+        )
 
     def match_gse(
         self,
@@ -119,15 +144,12 @@ class MeSHMatcher:
         return filtered
 
     def _match_text(self, text: str, weight: float = 1.0) -> dict[str, float]:
-        """
-        Match MeSH terms in text.
+        """Fast two-pass MeSH matching.
 
-        Args:
-            text: Text to search
-            weight: Weight multiplier for this text field
-
-        Returns:
-            Dictionary of mesh_id -> confidence score
+        Pass 1 — token lookup: extract words from text, look up each word in
+                  single_lookup (O(tokens) dict hits, no scanning).
+        Pass 2 — phrase scan: check only multi-word term_lookup keys that
+                  start with a word seen in the text (candidate filtering).
         """
         if not text:
             return {}
@@ -135,39 +157,26 @@ class MeSHMatcher:
         text_lower = text.lower()
         matches: dict[str, float] = {}
 
-        # Token-based matching
-        # Split text into tokens for better matching
-        tokens = re.findall(r'\b\w+\b', text_lower)
+        # ── Pass 1: single-word token lookup ─────────────────────────────────
+        tokens = re.findall(r'\b[a-z]\w{3,}\b', text_lower)  # min 4 chars
         token_set = set(tokens)
 
-        for term_text, mesh_ids in self.term_lookup.items():
-            # Skip very short terms to reduce false positives
-            if len(term_text) < 4:
-                continue
+        for tok in token_set:
+            if tok in self.single_lookup:
+                for mesh_id, base_conf in self.single_lookup[tok]:
+                    conf = base_conf * weight
+                    if mesh_id not in matches or matches[mesh_id] < conf:
+                        matches[mesh_id] = conf
 
-            # Calculate confidence based on match quality
-            confidence = 0.0
-
-            # Exact phrase match (highest confidence)
-            if term_text in text_lower:
-                # Boost confidence based on term length
-                term_len = len(term_text.split())
-                confidence = min(1.0, 0.5 + (term_len * 0.1))
-
-            # Token-based match (lower confidence)
-            else:
-                term_tokens = set(term_text.split())
-                if term_tokens.issubset(token_set):
-                    overlap = len(term_tokens)
-                    confidence = min(0.7, 0.3 + (overlap * 0.1))
-
-            if confidence > 0:
-                confidence *= weight
-                for mesh_id in mesh_ids:
-                    if mesh_id in matches:
-                        matches[mesh_id] = max(matches[mesh_id], confidence)
-                    else:
-                        matches[mesh_id] = confidence
+        # ── Pass 2: multi-word phrase lookup via first-word index ────────────
+        for tok in token_set:
+            for phrase, mesh_ids in self.phrase_by_first_word.get(tok, {}).items():
+                if phrase in text_lower:
+                    n_words = phrase.count(" ") + 1
+                    conf = min(1.0, 0.5 + n_words * 0.15) * weight
+                    for mesh_id in mesh_ids:
+                        if mesh_id not in matches or matches[mesh_id] < conf:
+                            matches[mesh_id] = conf
 
         return matches
 

@@ -14,6 +14,8 @@ from db import GSESeries
 from db.session import SessionLocal
 from search import HybridSearchEngine
 from streamlit_ingest import show_ingestion_interface
+from streamlit_analytics import show_analytics_dashboard
+from streamlit_analysis import show_analysis_pipeline
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -24,7 +26,13 @@ st.set_page_config(
     page_title="GEO Datasets - Smart Search",
     page_icon="🔬",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
+)
+
+# Force sidebar to always start expanded — clears browser localStorage cache
+st.markdown(
+    "<script>localStorage.removeItem('streamlit:sidebarState');</script>",
+    unsafe_allow_html=True,
 )
 
 # Compact sidebar CSS — tight within groups, breathing room between groups
@@ -74,14 +82,60 @@ st.markdown("""
 .main p.geo-heading { font-size: 1.6rem !important; font-weight: 700 !important; }
 
 /* Remove default top padding on main content */
-.block-container { padding-top: 1.5rem !important; padding-bottom: 0 !important; }
+/* Hide Streamlit top header bar */
+header[data-testid="stHeader"] { display: none !important; }
 
-/* Remove sidebar top padding */
-[data-testid="stSidebar"] section[data-testid="stSidebarContent"] > div:first-child { padding-top: 0.5rem !important; }
+.block-container {
+    padding-top: 0.8rem !important;
+    padding-bottom: 0 !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    max-width: 100% !important;
+}
+
+/* Hide sidebar and all toggle controls completely */
+[data-testid="stSidebar"] { display: none !important; }
 [data-testid="stSidebarNav"] { display: none !important; }
+[data-testid="collapsedControl"] { display: none !important; }
+
+/* Expand main content to full width */
+.appview-container .main .block-container { max-width: 100% !important; }
+
+/* Global base font */
+html, body, [class*="css"] { font-size: 16px !important; }
+.stMarkdown p { font-size: 1rem !important; }
+.stMarkdown h1 { font-size: 1.8rem !important; }
+.stMarkdown h2 { font-size: 1.4rem !important; }
+.stMarkdown h3 { font-size: 1.2rem !important; }
+.stMarkdown h4, .stMarkdown h5 { font-size: 1.05rem !important; }
+
+/* Sub-page headings (st.title → h1, st.header → h2) match main heading */
+h1 { font-size: 1.8rem !important; font-weight: 800 !important; color: #1a1a2e !important; letter-spacing: -0.5px !important; }
+h2 { font-size: 1.4rem !important; font-weight: 700 !important; color: #1a1a2e !important; }
+
+/* Metrics */
+[data-testid="stMetricLabel"] { font-size: 0.95rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.4rem !important; }
+
+/* Inputs */
+.stTextInput input, .stSelectbox select { font-size: 1rem !important; }
+.stButton button { font-size: 1rem !important; padding: 0.35rem 1rem !important; }
+
+/* Top nav radio — grey background panel */
+div[data-testid="stRadio"] {
+    background: #f0f2f6;
+    border-radius: 8px;
+    padding: 8px 20px 10px 20px;
+    margin-bottom: 0.8rem;
+}
+.stRadio label { font-size: 1.05rem !important; font-weight: 500 !important; padding: 4px 12px !important; }
+.stRadio > div { gap: 6px !important; }
+
+/* Tables */
+.stDataFrame { font-size: 0.95rem !important; }
 
 /* Main page title */
-.geo-title { font-size: 1.4rem !important; font-weight: 700; margin: 0 0 6px 0; line-height: 1.2; }
+.geo-title { font-size: 1.2rem !important; font-weight: 700; margin: 0 0 4px 0; line-height: 1.2; }
 
 /* Hide Deploy button and hamburger menu */
 [data-testid="stToolbar"] { display: none !important; }
@@ -223,6 +277,10 @@ def render_result_card(result: dict[str, Any]) -> None:
 </div>
 """
     st.markdown(card_html, unsafe_allow_html=True)
+    if st.button("🧬 Analyze", key=f"analyze_{accession}", help="Open in Expression Analysis pipeline"):
+        st.session_state["analysis_gse_id"] = accession
+        st.session_state["nav_page"] = "🧬 Analysis"
+        st.rerun()
 
 
 
@@ -318,12 +376,29 @@ def render_documentation() -> None:
 def main() -> None:
     """Main Streamlit application."""
 
-    # Sidebar navigation
-    st.sidebar.markdown("### 🔬 GEOSearch")
-    page = st.sidebar.radio(
-        "nav", ["🔍 Search", "📥 Ingest", "📚 Docs"],
-        index=0, label_visibility="collapsed",
+    # ── Heading + top horizontal navigation ──────────────────────────────────
+    st.markdown("""
+<div style="padding: 0.5rem 0 0.2rem 0;">
+  <span style="font-size:1.8rem; font-weight:800; color:#1a1a2e; letter-spacing:-0.5px;">
+    🔬 GEO: AI based Biomedical Datasets Discovery
+  </span><br/>
+  <span style="font-size:0.82rem; color:#666; font-weight:400;">
+    Semantic · Lexical · MeSH-enhanced search over 129,000+ genomics datasets
+  </span>
+</div>
+""", unsafe_allow_html=True)
+
+    nav_options = ["🔍 Search", "📥 Ingest", "📊 Analytics", "🧬 Analysis", "📚 Docs"]
+    nav_default = nav_options.index(st.session_state.pop("nav_page", "🔍 Search"))
+
+    selected = st.radio(
+        "nav",
+        nav_options,
+        index=nav_default,
+        horizontal=True,
+        label_visibility="collapsed",
     )
+    page = selected
 
     if page == "📚 Docs":
         render_documentation()
@@ -331,6 +406,14 @@ def main() -> None:
 
     if page == "📥 Ingest":
         show_ingestion_interface()
+        return
+
+    if page == "📊 Analytics":
+        show_analytics_dashboard()
+        return
+
+    if page == "🧬 Analysis":
+        show_analysis_pipeline()
         return
 
     try:
@@ -342,26 +425,6 @@ def main() -> None:
 
     date_min, date_max = filter_options["date_range"]
 
-    st.sidebar.markdown("---")
-    organisms = st.sidebar.multiselect(
-        "Organism", options=filter_options["organisms"], default=None, placeholder="All")
-    tech_type = st.sidebar.selectbox(
-        "Technology", options=["All"] + filter_options["tech_types"], index=0)
-    if date_min and date_max:
-        date_start = st.sidebar.date_input("From", value=None,
-            min_value=date_min.date(), max_value=date_max.date())
-        date_end = st.sidebar.date_input("To", value=None,
-            min_value=date_min.date(), max_value=date_max.date())
-    else:
-        date_start = date_end = None
-
-    st.sidebar.markdown("---")
-    use_semantic = st.sidebar.checkbox("Semantic", value=True, help="AI vector similarity")
-    use_lexical  = st.sidebar.checkbox("Keyword",  value=True, help="Full-text search")
-    use_mesh     = st.sidebar.checkbox("MeSH",     value=True, help="Medical synonym expansion")
-
-    st.header("GEO: AI based Biomedical Datasets Discovery")
-
     col_q, col_s = st.columns([7, 1])
     with col_q:
         query = st.text_input(
@@ -371,6 +434,29 @@ def main() -> None:
         )
     with col_s:
         search_clicked = st.button("Search", type="primary", use_container_width=True)
+
+    # ── Inline filters ────────────────────────────────────────────────────────
+    with st.expander("Filters & Search Options", expanded=False):
+        fc1, fc2, fc3, fc4 = st.columns([2, 2, 1.5, 1.5])
+        with fc1:
+            organisms = st.multiselect(
+                "Organism", options=filter_options["organisms"], default=None, placeholder="All")
+        with fc2:
+            tech_type = st.selectbox(
+                "Technology", options=["All"] + filter_options["tech_types"], index=0)
+        with fc3:
+            date_start = st.date_input("From", value=None,
+                min_value=date_min.date() if date_min else None,
+                max_value=date_max.date() if date_max else None) if date_min and date_max else None
+        with fc4:
+            date_end = st.date_input("To", value=None,
+                min_value=date_min.date() if date_min else None,
+                max_value=date_max.date() if date_max else None) if date_min and date_max else None
+
+        sc1, sc2, sc3 = st.columns(3)
+        use_semantic = sc1.checkbox("Semantic search", value=True, help="AI vector similarity")
+        use_lexical  = sc2.checkbox("Keyword search",  value=True, help="Full-text search")
+        use_mesh     = sc3.checkbox("MeSH expansion",  value=True, help="Medical synonym expansion")
 
     # Perform search
     if search_clicked and query:
