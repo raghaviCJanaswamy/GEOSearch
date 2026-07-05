@@ -92,7 +92,7 @@ class HybridSearchEngine:
                 semantic_results = semantic_search(
                     query=expanded_query,
                     top_k=settings.semantic_top_k,
-                    min_score=0.62,
+                    min_score=0.65,
                 )
                 # If too few results, the query may be a lay term whose embedding
                 # lands far from clinical vocabulary — relax threshold to recover recall
@@ -100,7 +100,7 @@ class HybridSearchEngine:
                     semantic_results = semantic_search(
                         query=expanded_query,
                         top_k=settings.semantic_top_k,
-                        min_score=0.55,
+                        min_score=0.60,
                     )
                     logger.info(f"Semantic search (relaxed threshold): {len(semantic_results)} results")
                 else:
@@ -113,7 +113,11 @@ class HybridSearchEngine:
         # so each is OR'd, not AND'd together
         lexical_results = []
         if use_lexical:
-            mesh_preferred = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
+            # Cap MeSH expansion to top 5 most specific terms to prevent over-retrieval.
+            # Too many OR'd MeSH synonyms cause broad queries like "lung cancer" to match
+            # thousands of loosely related datasets.
+            all_mesh_terms = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
+            mesh_preferred = all_mesh_terms[:5]
             lexical_results = self._lexical_search(
                 query=query,
                 mesh_terms=mesh_preferred,
@@ -227,10 +231,14 @@ class HybridSearchEngine:
                 combined_tsquery = combined_tsquery.op("||")(
                     func.plainto_tsquery("english", mt_cleaned)
                 )
-                # Also add prefix variant of first word of multi-word MeSH terms
+                # Add prefix variant only for long clinical words not already in the query
                 # e.g. "Myocardial Infarction" → "myocard:*" catches myocardial/myocardium
+                # Skip short anatomy words like "lung", "small" that over-match
                 mt_words = mt_cleaned.split()
-                if len(mt_words) >= 2 and len(mt_words[0]) >= 5:
+                query_words_lower = query.lower().split()
+                if (len(mt_words) >= 2
+                        and len(mt_words[0]) >= 8
+                        and mt_words[0].lower() not in query_words_lower):
                     prefix = mt_words[0][:7].lower()
                     try:
                         combined_tsquery = combined_tsquery.op("||")(

@@ -14,6 +14,8 @@ from db import GSESeries
 from db.session import SessionLocal
 from search import HybridSearchEngine
 from streamlit_ingest import show_ingestion_interface
+from streamlit_analytics import show_analytics_dashboard
+from streamlit_analysis import show_analysis_pipeline
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -27,11 +29,56 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Compact sidebar CSS — tight within groups, breathing room between groups
+# Reset persisted sidebar collapse state so left menu remains visible.
+st.markdown(
+    "<script>localStorage.removeItem('streamlit:sidebarState');</script>",
+    unsafe_allow_html=True,
+)
+
+# Persistent left sidebar menu and compact filters
 st.markdown("""
 <style>
-[data-testid="stSidebar"] { min-width: 200px !important; max-width: 220px !important; }
-[data-testid="stSidebar"] section[data-testid="stSidebarContent"] { padding: 10px 12px !important; }
+:root {
+    --app-heading: #1a1a2e;
+    --app-title: #14213d;
+    --tab-border: #d4d8df;
+    --tab-bar-bg: #eef1f5;
+    --tab-text: #303744;
+    --tab-hover: #e4e9f0;
+    --tab-active-bg: #ffffff;
+    --tab-active-border: #dce1e8;
+    --muted-text: #5f6368;
+}
+
+@media (prefers-color-scheme: dark) {
+    :root {
+        --app-heading: #e7ecf4;
+        --app-title: #ecf1fa;
+        --tab-border: #343b46;
+        --tab-bar-bg: #1f2631;
+        --tab-text: #d4dbe8;
+        --tab-hover: #2b3442;
+        --tab-active-bg: #2a3341;
+        --tab-active-border: #465164;
+        --muted-text: #aab3c3;
+    }
+}
+
+[data-testid="stSidebar"] {
+    min-width: 220px !important;
+    max-width: 260px !important;
+    width: 240px !important;
+    display: block !important;
+    visibility: visible !important;
+    transform: none !important;
+}
+[data-testid="stSidebar"] section[data-testid="stSidebarContent"] { padding: 12px 14px !important; }
+[data-testid="stSidebar"][aria-expanded="false"] {
+    min-width: 220px !important;
+    max-width: 260px !important;
+    width: 240px !important;
+    transform: none !important;
+}
 
 /* Widget labels */
 [data-testid="stSidebar"] label { font-size: 0.78rem !important; margin-bottom: 0 !important; }
@@ -74,14 +121,96 @@ st.markdown("""
 .main p.geo-heading { font-size: 1.6rem !important; font-weight: 700 !important; }
 
 /* Remove default top padding on main content */
-.block-container { padding-top: 1.5rem !important; padding-bottom: 0 !important; }
+/* Hide Streamlit top header bar */
+header[data-testid="stHeader"] { display: none !important; }
 
-/* Remove sidebar top padding */
-[data-testid="stSidebar"] section[data-testid="stSidebarContent"] > div:first-child { padding-top: 0.5rem !important; }
+.block-container {
+    padding-top: 0.8rem !important;
+    padding-bottom: 0 !important;
+    padding-left: 2rem !important;
+    padding-right: 2rem !important;
+    max-width: 100% !important;
+}
+
+/* Keep sidebar fixed and non-collapsible */
 [data-testid="stSidebarNav"] { display: none !important; }
+[data-testid="collapsedControl"] { display: none !important; }
+[data-testid="stSidebarCollapseButton"] { display: none !important; }
+
+/* Expand main content to full width */
+.appview-container .main .block-container { max-width: 100% !important; }
+
+/* Global base font */
+html, body, [class*="css"] { font-size: 15px !important; }
+.stMarkdown p { font-size: 0.95rem !important; }
+.stMarkdown h1 { font-size: 1.65rem !important; }
+.stMarkdown h2 { font-size: 1.3rem !important; }
+.stMarkdown h3 { font-size: 1.12rem !important; }
+.stMarkdown h4, .stMarkdown h5 { font-size: 1rem !important; }
+
+/* Sub-page headings (st.title → h1, st.header → h2) match main heading */
+h1 { font-size: 1.65rem !important; font-weight: 800 !important; color: var(--app-heading) !important; letter-spacing: -0.4px !important; }
+h2 { font-size: 1.3rem !important; font-weight: 700 !important; color: var(--app-heading) !important; }
+
+/* Metrics */
+[data-testid="stMetricLabel"] { font-size: 0.95rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.25rem !important; }
+
+/* Inputs */
+.stTextInput input, .stSelectbox select { font-size: 0.95rem !important; }
+.stButton button { font-size: 0.95rem !important; padding: 0.32rem 0.9rem !important; }
+
+/* Global submenu/tab bar styling across pages */
+[data-testid="stTabs"] [role="tablist"] {
+    gap: 0.2rem;
+    border: 1px solid var(--tab-border);
+    border-radius: 10px;
+    background: var(--tab-bar-bg);
+    padding: 0.3rem 0.35rem;
+    margin-bottom: 1rem;
+    overflow-x: auto;
+    scrollbar-width: thin;
+}
+
+[data-testid="stTabs"] [role="tab"] {
+    border: 1px solid transparent !important;
+    background: transparent !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 8px !important;
+    padding: 0.32rem 0.65rem 0.46rem 0.65rem !important;
+    margin-right: 0.08rem;
+}
+
+[data-testid="stTabs"] [role="tab"] p {
+    font-size: 0.92rem !important;
+    font-weight: 550 !important;
+    color: var(--tab-text) !important;
+    margin: 0 !important;
+    white-space: nowrap;
+}
+
+[data-testid="stTabs"] [role="tab"]:hover {
+    background: var(--tab-hover) !important;
+}
+
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+    background: var(--tab-active-bg) !important;
+    border-color: var(--tab-active-border) !important;
+    border-bottom-color: #ff4b57 !important;
+}
+
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] p {
+    color: #ff4b57 !important;
+}
+
+/* Keep global radio styling neutral; menu radio is styled separately below */
+.stRadio > div { gap: 6px !important; }
+
+/* Tables */
+.stDataFrame { font-size: 0.95rem !important; }
 
 /* Main page title */
-.geo-title { font-size: 1.4rem !important; font-weight: 700; margin: 0 0 6px 0; line-height: 1.2; }
+.geo-title { font-size: 1.2rem !important; font-weight: 700; margin: 0 0 4px 0; line-height: 1.2; }
 
 /* Hide Deploy button and hamburger menu */
 [data-testid="stToolbar"] { display: none !important; }
@@ -91,7 +220,6 @@ footer { display: none !important; }
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=3600)
 def get_filter_options():
     """Get available filter options from database."""
     db = SessionLocal()
@@ -122,7 +250,6 @@ def get_filter_options():
     }
 
 
-@st.cache_data(ttl=300)
 def perform_search(
     query: str,
     organisms: list[str],
@@ -223,6 +350,10 @@ def render_result_card(result: dict[str, Any]) -> None:
 </div>
 """
     st.markdown(card_html, unsafe_allow_html=True)
+    if st.button("🧬 Analyze", key=f"analyze_{accession}", help="Open in Expression Analysis pipeline"):
+        st.session_state["analysis_gse_id"] = accession
+        st.session_state["nav_page"] = "🧬 Analysis"
+        st.rerun()
 
 
 
@@ -315,22 +446,184 @@ def render_documentation() -> None:
             st.info("See DOCKER_DEPLOYMENT_QUICK_REFERENCE.md for common Docker commands.")
 
 
-def main() -> None:
-    """Main Streamlit application."""
-
-    # Sidebar navigation
-    st.sidebar.markdown("### 🔬 GEOSearch")
-    page = st.sidebar.radio(
-        "nav", ["🔍 Search", "📥 Ingest", "📚 Docs"],
-        index=0, label_visibility="collapsed",
+def render_footer_panel() -> None:
+    """Render persistent footer panel."""
+    st.markdown("---")
+    st.markdown(
+        """
+<div style="padding: 0.35rem 0 0.65rem 0; color:var(--muted-text); font-size:0.9rem; line-height:1.4;">
+  Data source: <a href="https://www.ncbi.nlm.nih.gov/geo/" target="_blank">NCBI GEO</a>
+  &nbsp;&nbsp;|&nbsp;&nbsp;
+  GEO Search: Semantic, lexical, and MeSH-enhanced discovery.
+</div>
+""",
+        unsafe_allow_html=True,
     )
 
-    if page == "📚 Docs":
+
+def main() -> None:
+    """Main Streamlit application."""
+    page_map = {
+        "Search": "search",
+        "Data Injestion": "ingest",
+        "Ánalytics": "analytics",
+        "Analysis": "analysis",
+        "Settings": "docs",
+    }
+    reverse_page_map = {v: k for k, v in page_map.items()}
+    legacy_page_map = {
+        "🔍 Search": "search",
+        "📥 Ingest": "ingest",
+        "📊 Analytics": "analytics",
+        "🧬 Analysis": "analysis",
+        "📚 Docs": "docs",
+    }
+
+    nav_state = st.session_state.pop("nav_page", "search")
+    if nav_state in legacy_page_map:
+        nav_state = legacy_page_map[nav_state]
+    nav_default = ["Search", "Data Injestion", "Ánalytics", "Analysis", "Settings"].index(
+        reverse_page_map.get(nav_state, "Search")
+    )
+
+    st.markdown(
+        """
+<style>
+[data-testid="stSidebar"] {
+    min-width: 220px !important;
+    max-width: 260px !important;
+    width: 240px !important;
+}
+[data-testid="stSidebar"] section[data-testid="stSidebarContent"] {
+    background: #e9ebef !important;
+    border-radius: 16px;
+    margin: 10px;
+    padding: 12px 10px !important;
+}
+
+.left-menu-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #242a32;
+    line-height: 1.2;
+    margin: 0 0 0.4rem 0;
+}
+
+.left-menu-sub {
+    font-size: 0.78rem;
+    color: #5f6772;
+    margin: 0.1rem 0 0.2rem 0;
+}
+
+[data-testid="stSidebar"] div[data-testid="stRadio"] {
+    background: transparent !important;
+    padding: 0 !important;
+    margin: 0 !important;
+}
+
+[data-testid="stSidebar"] div[role="radiogroup"] > label {
+    background: transparent;
+    border-radius: 10px;
+    padding: 8px 8px !important;
+    margin: 4px 0 !important;
+    color: #343a45 !important;
+    border: 1px solid transparent;
+    transition: background-color 120ms ease;
+}
+
+[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+    background: #dde1e8;
+}
+
+[data-testid="stSidebar"] div[role="radiogroup"] > label:has(input:checked) {
+    background: #ff4b57 !important;
+    color: #ffffff !important;
+}
+
+[data-testid="stSidebar"] div[role="radiogroup"] > label > div:first-child {
+    display: none !important;
+}
+
+[data-testid="stSidebar"] div[role="radiogroup"] > label p {
+    font-size: 1rem !important;
+    font-weight: 600 !important;
+    margin: 0 !important;
+}
+
+.footer-panel {
+    padding: 0.3rem 0 0.55rem 0;
+    color: var(--muted-text);
+    font-size: 0.9rem;
+}
+
+@media (prefers-color-scheme: dark) {
+    [data-testid="stSidebar"] section[data-testid="stSidebarContent"] {
+        background: #1f2631 !important;
+        border: 1px solid #343c48;
+    }
+
+    .left-menu-title {
+        color: #e6ecf7;
+    }
+
+    .left-menu-sub {
+        color: #aab4c5;
+    }
+
+    [data-testid="stSidebar"] div[role="radiogroup"] > label {
+        color: #d4dbe8 !important;
+    }
+
+    [data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+        background: #2b3442;
+    }
+}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+<div style="font-size:1.8rem;font-weight:800;color:var(--app-title);letter-spacing:-0.35px;margin:0 0 0.7rem 0;line-height:1.2;text-align:center;">
+  🔬 GEO: AI Based Biomedical Datasets Discovery
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+    with st.sidebar:
+        st.markdown('<div class="left-menu-title">🖥 Main Menu</div>', unsafe_allow_html=True)
+        st.markdown("---")
+        menu_choice = st.radio(
+            "Main Menu",
+            ["🔍 Search", "⇪ Data Injestion", "☰ Ánalytics", "🧬 Analysis", "⚙ Settings"],
+            index=nav_default,
+            label_visibility="collapsed",
+            key="left_menu_nav",
+        )
+        st.markdown('<p class="left-menu-sub">Data from NCBI GEO</p>', unsafe_allow_html=True)
+
+    page = page_map[menu_choice.split(" ", 1)[1]]
+
+    if page == "docs":
         render_documentation()
+        render_footer_panel()
         return
 
-    if page == "📥 Ingest":
+    if page == "ingest":
         show_ingestion_interface()
+        render_footer_panel()
+        return
+
+    if page == "analytics":
+        show_analytics_dashboard()
+        render_footer_panel()
+        return
+
+    if page == "analysis":
+        show_analysis_pipeline()
+        render_footer_panel()
         return
 
     try:
@@ -342,26 +635,6 @@ def main() -> None:
 
     date_min, date_max = filter_options["date_range"]
 
-    st.sidebar.markdown("---")
-    organisms = st.sidebar.multiselect(
-        "Organism", options=filter_options["organisms"], default=None, placeholder="All")
-    tech_type = st.sidebar.selectbox(
-        "Technology", options=["All"] + filter_options["tech_types"], index=0)
-    if date_min and date_max:
-        date_start = st.sidebar.date_input("From", value=None,
-            min_value=date_min.date(), max_value=date_max.date())
-        date_end = st.sidebar.date_input("To", value=None,
-            min_value=date_min.date(), max_value=date_max.date())
-    else:
-        date_start = date_end = None
-
-    st.sidebar.markdown("---")
-    use_semantic = st.sidebar.checkbox("Semantic", value=True, help="AI vector similarity")
-    use_lexical  = st.sidebar.checkbox("Keyword",  value=True, help="Full-text search")
-    use_mesh     = st.sidebar.checkbox("MeSH",     value=True, help="Medical synonym expansion")
-
-    st.header("GEO: AI based Biomedical Datasets Discovery")
-
     col_q, col_s = st.columns([7, 1])
     with col_q:
         query = st.text_input(
@@ -371,6 +644,29 @@ def main() -> None:
         )
     with col_s:
         search_clicked = st.button("Search", type="primary", use_container_width=True)
+
+    # ── Inline filters ────────────────────────────────────────────────────────
+    with st.expander("Filters & Search Options", expanded=False):
+        fc1, fc2, fc3, fc4 = st.columns([2, 2, 1.5, 1.5])
+        with fc1:
+            organisms = st.multiselect(
+                "Organism", options=filter_options["organisms"], default=None, placeholder="All")
+        with fc2:
+            tech_type = st.selectbox(
+                "Technology", options=["All"] + filter_options["tech_types"], index=0)
+        with fc3:
+            date_start = st.date_input("From", value=None,
+                min_value=date_min.date() if date_min else None,
+                max_value=date_max.date() if date_max else None) if date_min and date_max else None
+        with fc4:
+            date_end = st.date_input("To", value=None,
+                min_value=date_min.date() if date_min else None,
+                max_value=date_max.date() if date_max else None) if date_min and date_max else None
+
+        sc1, sc2, sc3 = st.columns(3)
+        use_semantic = sc1.checkbox("Semantic search", value=True, help="AI vector similarity")
+        use_lexical  = sc2.checkbox("Keyword search",  value=True, help="Full-text search")
+        use_mesh     = sc3.checkbox("MeSH expansion",  value=True, help="Medical synonym expansion")
 
     # Perform search
     if search_clicked and query:
@@ -529,9 +825,8 @@ def main() -> None:
         else:
             st.warning("No results found. Try adjusting your search query or filters.")
 
-    st.sidebar.markdown("---")
-    st.sidebar.caption("Data from [NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/)")
+    render_footer_panel()
 
-
+ 
 if __name__ == "__main__":
     main()
