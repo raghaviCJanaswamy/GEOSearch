@@ -1,0 +1,9 @@
+[server]
+maxUploadSize = 400
+fileWatcherType = "none"
+
+[client]
+showSidebarNavigation = true
+
+[ui]
+hideSidebarNav = false

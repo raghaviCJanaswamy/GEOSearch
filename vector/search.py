@@ -32,6 +32,7 @@ def semantic_search(
     query: str,
     top_k: int = 100,
     filter_expr: str | None = None,
+    min_score: float = 0.65,
 ) -> list[dict[str, Any]]:
     """
     Perform semantic search over GEO datasets.
@@ -61,5 +62,10 @@ def semantic_search(
         filter_expr=filter_expr,
     )
 
-    logger.info(f"Semantic search returned {len(results)} results")
+    # Filter out low-confidence semantic matches to avoid inflating result counts.
+    # Scores below min_score are loosely related by topic but not specific enough.
+    if min_score > 0:
+        results = [r for r in results if r["score"] >= min_score]
+
+    logger.info(f"Semantic search returned {len(results)} results (min_score={min_score})")
     return results

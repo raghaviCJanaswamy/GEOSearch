@@ -14,6 +14,8 @@ from db import GSESeries
 from db.session import SessionLocal
 from search import HybridSearchEngine
 from streamlit_ingest import show_ingestion_interface
+from streamlit_analytics import show_analytics_dashboard
+from streamlit_analysis import show_analysis_pipeline
 
 # Configure logging
 logging.basicConfig(level=settings.log_level)
@@ -24,7 +26,7 @@ st.set_page_config(
     page_title="GEO Datasets - Smart Search",
     page_icon="🔬",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # Compact sidebar CSS — tight within groups, breathing room between groups
@@ -129,24 +131,18 @@ def perform_search(
     tech_type: str | None,
     date_start: datetime | None,
     date_end: datetime | None,
-    min_samples: int | None,
     use_semantic: bool,
     use_lexical: bool,
     use_mesh: bool,
-    top_k: int,
 ) -> dict[str, Any]:
     """Perform search with caching."""
     db = SessionLocal()
 
-    # Build filters
     filters = {}
-
     if organisms:
         filters["organisms"] = organisms
-
     if tech_type and tech_type != "All":
         filters["tech_type"] = tech_type
-
     if date_start or date_end:
         filters["date_range"] = {}
         if date_start:
@@ -335,6 +331,7 @@ def main() -> None:
         "nav", ["🔍 Search", "📥 Ingest", "📚 Docs"],
         index=0, label_visibility="collapsed",
     )
+    page = selected
 
     if page == "📚 Docs":
         render_documentation()
@@ -398,7 +395,6 @@ def main() -> None:
                     use_semantic=use_semantic,
                     use_lexical=use_lexical,
                     use_mesh=use_mesh,
-                    top_k=top_k,
                 )
                 st.session_state["_results"] = results
                 st.session_state["_search_query"] = query

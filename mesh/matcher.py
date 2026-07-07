@@ -27,9 +27,7 @@ class MeSHMatcher:
         """
         Initialize matcher.
 
-        Args:
-            db: Database session
-        """
+    def __init__(self, db: Session):
         self.db = db
 
         # Load MeSH terms into memory for faster matching (cached at class level)
@@ -40,7 +38,6 @@ class MeSHMatcher:
     def _load_mesh_terms(self) -> None:
         """Load all MeSH terms from database into class-level cache."""
         logger.info("Loading MeSH terms for matching...")
-
         terms = self.db.query(MeshTerm).all()
 
         # Build lookup dictionary: term_text -> mesh_id
@@ -119,15 +116,12 @@ class MeSHMatcher:
         return filtered
 
     def _match_text(self, text: str, weight: float = 1.0) -> dict[str, float]:
-        """
-        Match MeSH terms in text.
+        """Fast two-pass MeSH matching.
 
-        Args:
-            text: Text to search
-            weight: Weight multiplier for this text field
-
-        Returns:
-            Dictionary of mesh_id -> confidence score
+        Pass 1 — token lookup: extract words from text, look up each word in
+                  single_lookup (O(tokens) dict hits, no scanning).
+        Pass 2 — phrase scan: check only multi-word term_lookup keys that
+                  start with a word seen in the text (candidate filtering).
         """
         if not text:
             return {}
@@ -135,39 +129,26 @@ class MeSHMatcher:
         text_lower = text.lower()
         matches: dict[str, float] = {}
 
-        # Token-based matching
-        # Split text into tokens for better matching
-        tokens = re.findall(r'\b\w+\b', text_lower)
+        # ── Pass 1: single-word token lookup ─────────────────────────────────
+        tokens = re.findall(r'\b[a-z]\w{3,}\b', text_lower)  # min 4 chars
         token_set = set(tokens)
 
-        for term_text, mesh_ids in self.term_lookup.items():
-            # Skip very short terms to reduce false positives
-            if len(term_text) < 4:
-                continue
+        for tok in token_set:
+            if tok in self.single_lookup:
+                for mesh_id, base_conf in self.single_lookup[tok]:
+                    conf = base_conf * weight
+                    if mesh_id not in matches or matches[mesh_id] < conf:
+                        matches[mesh_id] = conf
 
-            # Calculate confidence based on match quality
-            confidence = 0.0
-
-            # Exact phrase match (highest confidence)
-            if term_text in text_lower:
-                # Boost confidence based on term length
-                term_len = len(term_text.split())
-                confidence = min(1.0, 0.5 + (term_len * 0.1))
-
-            # Token-based match (lower confidence)
-            else:
-                term_tokens = set(term_text.split())
-                if term_tokens.issubset(token_set):
-                    overlap = len(term_tokens)
-                    confidence = min(0.7, 0.3 + (overlap * 0.1))
-
-            if confidence > 0:
-                confidence *= weight
-                for mesh_id in mesh_ids:
-                    if mesh_id in matches:
-                        matches[mesh_id] = max(matches[mesh_id], confidence)
-                    else:
-                        matches[mesh_id] = confidence
+        # ── Pass 2: multi-word phrase lookup via first-word index ────────────
+        for tok in token_set:
+            for phrase, mesh_ids in self.phrase_by_first_word.get(tok, {}).items():
+                if phrase in text_lower:
+                    n_words = phrase.count(" ") + 1
+                    conf = min(1.0, 0.5 + n_words * 0.15) * weight
+                    for mesh_id in mesh_ids:
+                        if mesh_id not in matches or matches[mesh_id] < conf:
+                            matches[mesh_id] = conf
 
         return matches
 

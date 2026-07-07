@@ -41,7 +41,7 @@ class HybridSearchEngine:
         use_semantic: bool = True,
         use_lexical: bool = True,
         use_mesh: bool = True,
-        top_k: int | None = None,
+        top_k: int | None = None,  # kept for API compatibility but no longer limits results
     ) -> dict[str, Any]:
         """
         Perform hybrid search.
@@ -67,9 +67,6 @@ class HybridSearchEngine:
             ...     top_k=50,
             ... )
         """
-        if top_k is None:
-            top_k = settings.final_top_k
-
         filters = filters or {}
 
         logger.info(
@@ -95,19 +92,36 @@ class HybridSearchEngine:
                 semantic_results = semantic_search(
                     query=expanded_query,
                     top_k=settings.semantic_top_k,
+                    min_score=0.65,
                 )
-                logger.info(f"Semantic search: {len(semantic_results)} results")
+                # If too few results, the query may be a lay term whose embedding
+                # lands far from clinical vocabulary — relax threshold to recover recall
+                if len(semantic_results) < 50:
+                    semantic_results = semantic_search(
+                        query=expanded_query,
+                        top_k=settings.semantic_top_k,
+                        min_score=0.60,
+                    )
+                    logger.info(f"Semantic search (relaxed threshold): {len(semantic_results)} results")
+                else:
+                    logger.info(f"Semantic search: {len(semantic_results)} results")
             except Exception as e:
                 logger.error(f"Semantic search failed: {e}", exc_info=True)
                 # Continue without semantic results
 
-        # Step 3: Lexical search
+        # Step 3: Lexical search — pass original query + matched MeSH terms separately
+        # so each is OR'd, not AND'd together
         lexical_results = []
         if use_lexical:
+            # Cap MeSH expansion to top 5 most specific terms to prevent over-retrieval.
+            # Too many OR'd MeSH synonyms cause broad queries like "lung cancer" to match
+            # thousands of loosely related datasets.
+            all_mesh_terms = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
+            mesh_preferred = all_mesh_terms[:5]
             lexical_results = self._lexical_search(
                 query=query,
+                mesh_terms=mesh_preferred,
                 filters=filters,
-                top_k=settings.lexical_top_k,
             )
             logger.info(f"Lexical search: {len(lexical_results)} results")
 
@@ -118,12 +132,11 @@ class HybridSearchEngine:
             matched_mesh_ids=matched_mesh_ids,
         )
 
-        # Step 5: Apply filters and fetch full metadata
+        # Step 5: Apply filters and fetch full metadata — no cap, return all matches
         final_results = self._fetch_and_filter_results(
-            ranked_accessions=combined_results[:top_k * 2],  # Fetch more for filtering
+            ranked_accessions=combined_results,
             filters=filters,
             matched_mesh_ids=matched_mesh_ids,
-            top_k=top_k,
         )
 
         # Prepare metadata
@@ -148,7 +161,8 @@ class HybridSearchEngine:
         self,
         query: str,
         filters: dict[str, Any],
-        top_k: int,
+        mesh_terms: list[str] | None = None,
+        top_k: int = 0,  # unused — kept for signature compat
     ) -> list[dict[str, Any]]:
         """
         Perform lexical/keyword search using PostgreSQL full-text search.
@@ -183,7 +197,6 @@ class HybridSearchEngine:
         ts_rank = func.ts_rank(tsvec, tsquery)
         ts_match = tsvec.op("@@")(tsquery)
 
-        # Apply filters
         filter_conditions = self._build_filter_conditions(filters)
         base_filter = and_(ts_match, *filter_conditions) if filter_conditions else ts_match
 
@@ -332,7 +345,6 @@ class HybridSearchEngine:
         ranked_accessions: list[str],
         filters: dict[str, Any],
         matched_mesh_ids: list[str],
-        top_k: int,
     ) -> list[dict[str, Any]]:
         """
         Fetch full metadata for ranked results and apply filters.
@@ -394,9 +406,6 @@ class HybridSearchEngine:
                 "geo_url": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",
             }
             results.append(result)
-
-            if len(results) >= top_k:
-                break
 
         return results
 

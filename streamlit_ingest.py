@@ -3,6 +3,7 @@ Streamlit UI components for data ingestion.
 Provides interface to run GEO data ingestion from the Streamlit app.
 """
 import logging
+import time
 from datetime import datetime
 from typing import Any
 
@@ -60,10 +61,38 @@ def show_ingestion_interface() -> None:
             st.info("Ingestion history will be available once database is ready.")
 
     with tab3:
+        if db_available:
+            show_mesh_tagger()
+        else:
+            st.info("MeSH tagger will be available once database is ready.")
+
+    with tab4:
+        if db_available:
+            show_ingestion_history()
+        else:
+            st.info("Ingestion history will be available once database is ready.")
+
+    with tab5:
         show_ingestion_config()
     
     with tab4:
         show_database_initialization()
+
+    with tab6:
+        show_database_initialization()
+
+
+ORGANISM_OPTIONS = [
+    "Any",
+    "Homo sapiens",
+    "Mus musculus",
+    "Rattus norvegicus",
+    "Drosophila melanogaster",
+    "Caenorhabditis elegans",
+    "Danio rerio",
+    "Arabidopsis thaliana",
+    "Saccharomyces cerevisiae",
+]
 
 
 def show_query_ingestion() -> None:
@@ -105,46 +134,21 @@ def show_query_ingestion() -> None:
     # Advanced options
     col1, col2 = st.columns(2)
 
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         retmax = st.number_input(
-            "Number of Results",
-            min_value=1,
-            max_value=10000,
-            value=50,
-            step=10,
-            help="Maximum number of GEO records to fetch",
+            "Max Results", min_value=1, max_value=10000, value=50, step=10,
         )
-
     with col2:
-        skip_existing = st.checkbox(
-            "Skip Existing Records",
-            value=True,
-            help="Don't re-ingest datasets already in database",
-        )
+        skip_existing = st.checkbox("Skip Existing", value=True)
+    with col3:
+        mindate = st.date_input("From Date", value=None)
+    with col4:
+        maxdate = st.date_input("To Date", value=None)
 
-    # Date range filter (optional)
-    st.markdown("**Date Range (Optional)**")
-    date_col1, date_col2 = st.columns(2)
-
-    with date_col1:
-        mindate = st.date_input(
-            "From Date",
-            value=None,
-            help="Leave empty to ignore",
-        )
-
-    with date_col2:
-        maxdate = st.date_input(
-            "To Date",
-            value=None,
-            help="Leave empty to ignore",
-        )
-
-    # Format dates for NCBI API
     mindate_str = mindate.strftime("%Y/%m/%d") if mindate else None
     maxdate_str = maxdate.strftime("%Y/%m/%d") if maxdate else None
 
-    # Start ingestion button
     if st.button("🚀 Start Ingestion", type="primary", use_container_width=True):
         if not query:
             st.error("Please enter a search query")
@@ -164,12 +168,244 @@ def show_query_ingestion() -> None:
             return
 
         ingest_with_progress(
-            query=query,
+            query=full_query,
             retmax=retmax,
             mindate=mindate_str,
             maxdate=maxdate_str,
             skip_existing=skip_existing,
         )
+
+
+def _parse_txt_records(content: str) -> list[dict]:
+    """Parse gds_result_summary.txt content into raw record dicts."""
+    import re
+    blocks = re.split(r"\n(?=\d+\.\s)", content.strip())
+    records = []
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        lines = block.splitlines()
+        title = re.sub(r"^\d+\.\s*", "", lines[0]).strip() if lines else ""
+        summary = ""
+        for line in lines[1:]:
+            if line.startswith("(Submitter supplied)"):
+                summary = re.sub(r"^\(Submitter supplied\)\s*", "", line).strip().rstrip(" more...")
+                break
+        organism = ""
+        for line in lines:
+            m = re.match(r"Organism:\s*(.+)", line)
+            if m:
+                organism = m.group(1).strip()
+                break
+        tech_type_raw = ""
+        for line in lines:
+            m = re.match(r"Type:\s*(.+)", line)
+            if m:
+                tech_type_raw = m.group(1).strip()
+                break
+        platforms, sample_count = [], None
+        for line in lines:
+            m = re.match(r"Platform:\s*(.+)", line)
+            if m:
+                ps = m.group(1).strip()
+                for part in ps.split():
+                    if part.startswith("GPL") and part[3:].isdigit():
+                        platforms.append(int(part[3:]))
+                cm = re.search(r"(\d+)\s+Samples?", ps, re.IGNORECASE)
+                if cm:
+                    sample_count = int(cm.group(1))
+                break
+        accession = ""
+        for line in lines:
+            m = re.search(r"Accession:\s*(GSE\d+)", line)
+            if m:
+                accession = m.group(1).strip()
+                break
+        if not accession:
+            continue
+        records.append({
+            "accession": accession,
+            "title": title,
+            "summary": summary,
+            "overall_design": "",
+            "organisms": [organism] if organism else [],
+            "tech_type_raw": tech_type_raw,
+            "platforms": platforms,
+            "sample_count": sample_count,
+            "submission_date": None,
+            "pubmed_ids": [],
+        })
+    return records
+
+
+def show_file_import() -> None:
+    """Upload a GEO summary txt file and import into DB + Milvus."""
+    st.subheader("Import from File")
+    st.caption("Upload a GEO summary text file (e.g. gds_result_summary.txt) downloaded from NCBI.")
+
+    uploaded = st.file_uploader("Choose a .txt file", type=["txt"], key="geo_txt_upload")
+    skip_existing = st.checkbox("Skip records already in database", value=True, key="file_import_skip")
+
+    if uploaded is None:
+        st.info("Download a summary file from NCBI GEO search results, then upload it here.")
+        return
+
+    content = uploaded.read().decode("utf-8", errors="replace")
+    records = _parse_txt_records(content)
+
+    import re
+    total_blocks = len(re.split(r"\n(?=\d+\.\s)", content.strip()))
+    gsm_count = total_blocks - len(records)
+
+    if not records:
+        st.error("No records found in file — check the file format.")
+        return
+
+    st.success(
+        f"Found **{total_blocks} total entries** in `{uploaded.name}`:  \n"
+        f"- **{len(records)} GSE Series** (study-level datasets — these will be imported)  \n"
+        f"- **{gsm_count} GSM Samples** (individual samples — skipped, already covered by their GSE Series)"
+    )
+
+    with st.expander("Preview records", expanded=False):
+        for r in records[:5]:
+            st.markdown(f"**{r['accession']}** — {r['title'][:80]}")
+            st.caption(f"Organism: {', '.join(r['organisms']) or 'N/A'} | Samples: {r['sample_count']} | Type: {r['tech_type_raw'][:50]}")
+
+    # MeSH tagging option
+    with SessionLocal() as _db:
+        mesh_loaded = _db.execute(text("SELECT COUNT(*) FROM mesh_term")).scalar() or 0
+    tag_during_import = st.checkbox(
+        "🏷️ Auto-tag with MeSH terms during import",
+        value=mesh_loaded > 0,
+        disabled=mesh_loaded == 0,
+        help="Tags each record with MeSH descriptors as it is imported. Requires MeSH terms to be loaded first. Adds ~0.1s per record.",
+    )
+    if mesh_loaded == 0:
+        st.caption("⚠️ MeSH terms not loaded — load them first via the MeSH Tagger tab to enable this option.")
+
+    if st.button("Import into Database", type="primary", use_container_width=True, key="file_import_btn"):
+        try:
+            db = next(get_db())
+        except Exception as e:
+            st.error(f"Database not ready: {e}")
+            return
+
+        parser = GEOParser()
+        embedding_provider = get_embedding_provider()
+        vector_store = MilvusStore()
+
+        run = IngestRun(
+            query=f"txt_import:{uploaded.name}",
+            start_time=datetime.utcnow(),
+            status="running",
+            run_metadata={"source_file": uploaded.name, "total": len(records)},
+        )
+        db.add(run)
+        db.commit()
+
+        # Filter existing
+        skipped = 0
+        to_process = records
+        if skip_existing:
+            existing = {
+                row[0] for row in db.query(GSESeries.accession)
+                .filter(GSESeries.accession.in_([r["accession"] for r in records]))
+                .all()
+            }
+            to_process = [r for r in records if r["accession"] not in existing]
+            skipped = len(records) - len(to_process)
+
+        progress_bar = st.progress(0)
+        status_text  = st.empty()
+
+        success, errors, mesh_tagged = 0, 0, 0
+        parsed_for_embed: list[tuple[str, dict]] = []
+        total = len(to_process)
+
+        # Initialise MeSH matcher once if tagging enabled
+        mesh_matcher = None
+        if tag_during_import and mesh_loaded > 0:
+            from mesh.matcher import MeSHMatcher
+            mesh_matcher = MeSHMatcher(db)
+
+        mc1, mc2, mc3, mc4 = st.columns(4)
+        success_ph = mc1.empty()
+        error_ph   = mc2.empty()
+        skip_ph    = mc3.empty()
+        mesh_ph    = mc4.empty()
+
+        for i, raw in enumerate(to_process, 1):
+            status_text.info(f"Processing {raw['accession']} ({i}/{total})...")
+            progress_bar.progress(int(i / max(total, 1) * 80))
+            try:
+                parsed = parser.parse_gse_metadata(raw)
+                if not parsed:
+                    errors += 1
+                    continue
+                db.merge(GSESeries(**parsed))
+                db.commit()
+                parsed_for_embed.append((raw["accession"], parsed))
+                success += 1
+
+                # MeSH tag inline
+                if mesh_matcher:
+                    from db.models import GSEMesh
+                    try:
+                        for match in mesh_matcher.match_gse(raw["accession"], 0.3):
+                            db.merge(GSEMesh(
+                                accession=raw["accession"],
+                                mesh_id=match["mesh_id"],
+                                source="auto",
+                                confidence=match["confidence"],
+                            ))
+                            mesh_tagged += 1
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+
+            except Exception as e:
+                db.rollback()
+                errors += 1
+                logger.error(f"Failed {raw['accession']}: {e}")
+
+            success_ph.metric("Stored",      success)
+            error_ph.metric("Errors",        errors)
+            skip_ph.metric("Skipped",        skipped)
+            mesh_ph.metric("MeSH Tags",      mesh_tagged)
+
+        # Embeddings
+        if parsed_for_embed:
+            status_text.info(f"Generating embeddings for {len(parsed_for_embed)} records...")
+            try:
+                texts = [parser.prepare_embedding_text(p) for _, p in parsed_for_embed]
+                embeddings = embedding_provider.embed_texts(texts)
+                vectors = [
+                    {"accession": acc, "embedding": emb}
+                    for (acc, _), emb in zip(parsed_for_embed, embeddings)
+                    if emb is not None
+                ]
+                if vectors:
+                    vector_store.upsert(vectors)
+            except Exception as e:
+                st.warning(f"Embeddings failed: {e}")
+
+        progress_bar.progress(100)
+
+        run.end_time = datetime.utcnow()
+        run.total_count = len(records)
+        run.success_count = success
+        run.error_count = errors
+        run.status = "completed" if errors == 0 else "partial"
+        db.commit()
+        db.close()
+
+        if success > 0:
+            mesh_msg = f", **{mesh_tagged:,}** MeSH tags applied" if mesh_matcher else ""
+            status_text.success(f"Done! **{success:,}** records imported, **{errors}** errors, **{skipped}** skipped{mesh_msg}.")
+        else:
+            status_text.warning(f"No new records imported. {errors} errors, {skipped} skipped.")
 
 
 def ingest_with_progress(
@@ -481,53 +717,137 @@ def show_ingestion_history() -> None:
 
 def show_ingestion_config() -> None:
     """Display ingestion configuration options."""
-    st.subheader("Configuration")
+    st.subheader("System Configuration")
 
     from config import settings
+    from sqlalchemy import text
 
-    # Display current settings
-    st.markdown("**Current NCBI Settings:**")
+    def _row(label, value, status=None):
+        status_badge = f" &nbsp; `{status}`" if status else ""
+        return f"| **{label}** | {value}{status_badge} |"
 
-    col1, col2 = st.columns(2)
+    def _section(title, rows):
+        st.markdown(f"##### {title}")
+        table = "| Setting | Value |\n|---|---|\n" + "\n".join(rows)
+        st.markdown(table, unsafe_allow_html=True)
+        st.markdown("")
 
-    with col1:
-        st.info(f"📧 NCBI Email: {settings.ncbi_email}")
+    # ── Embedding Model ──────────────────────────────────────────────────────
+    try:
+        from vector.embeddings import get_embedding_provider
+        ep = get_embedding_provider()
+        dim = ep.get_dimension()
+        model_name = getattr(ep, "model_name", type(ep).__name__)
+        provider_type = type(ep).__name__.replace("EmbeddingProvider", "")
+        model_status = "✅ Loaded"
+    except Exception as e:
+        dim, model_name, provider_type = "—", str(e)[:60], "—"
+        model_status = "❌ Failed"
 
-    with col2:
-        has_api_key = "✅ Set" if settings.ncbi_api_key else "❌ Not Set"
-        st.info(f"🔑 NCBI API Key: {has_api_key}")
+    _section("🧠 Embedding Model", [
+        _row("Provider", provider_type),
+        _row("Model", model_name),
+        _row("Vector Dimensions", f"**{dim}**"),
+        _row("Status", model_status),
+    ])
 
-    # Rate limiting info
-    st.markdown("**Rate Limiting:**")
-    st.info(
-        f"⏱️ Rate Limit: {settings.rate_limit_qps} queries per second\n\n"
-        "This prevents overwhelming NCBI servers and respects their usage policies."
-    )
+    # ── Vector Database (Milvus) ──────────────────────────────────────────────
+    try:
+        from vector.milvus_store import MilvusStore
+        ms = MilvusStore()
+        vec_count = ms.count()
+        collection = getattr(settings, "milvus_collection_name", "gse_embeddings")
+        milvus_host = getattr(settings, "milvus_host", "milvus")
+        milvus_port = getattr(settings, "milvus_port", 19530)
+        milvus_status = "✅ Connected"
+    except Exception:
+        vec_count = 0
+        collection = getattr(settings, "milvus_collection_name", "gse_embeddings")
+        milvus_host = getattr(settings, "milvus_host", "milvus")
+        milvus_port = getattr(settings, "milvus_port", 19530)
+        milvus_status = "❌ Disconnected"
 
-    # Recommendations
-    st.markdown("**Recommendations for Better Ingestion:**")
-    st.markdown(
-        """
-    1. **Set NCBI Email** (Required)
-       - Configure in `.env` file: `NCBI_EMAIL=your.email@example.com`
-       - NCBI requires this to track usage
+    _section("🗄️ Vector Database (Milvus)", [
+        _row("Host", f"{milvus_host}:{milvus_port}"),
+        _row("Collection", collection),
+        _row("Vectors Stored", f"{vec_count:,}"),
+        _row("Vector Dimension", f"**{dim}**"),
+        _row("Status", milvus_status),
+    ])
 
-    2. **Add NCBI API Key** (Optional but Recommended)
-       - Get free API key at: https://www.ncbi.nlm.nih.gov/account/
-       - Increases rate limit from 3 to 10 queries/second
-       - Configure in `.env`: `NCBI_API_KEY=your-api-key`
+    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    try:
+        db = next(get_db())
+        pg_host = getattr(settings, "postgres_host", "postgres")
+        pg_port = getattr(settings, "postgres_port", 5432)
+        pg_db   = getattr(settings, "postgres_db", "geosearch")
+        gse_count  = db.execute(text("SELECT COUNT(*) FROM gse_series")).scalar() or 0
+        mesh_count = db.execute(text("SELECT COUNT(*) FROM mesh_term")).scalar() or 0
+        tag_count  = db.execute(text("SELECT COUNT(*) FROM gse_mesh")).scalar() or 0
+        od_count   = db.execute(text(
+            "SELECT COUNT(*) FROM gse_series WHERE overall_design IS NOT NULL AND overall_design != ''"
+        )).scalar() or 0
+        od_pct = round(od_count / gse_count * 100, 1) if gse_count > 0 else 0
+        tagged = db.execute(text("SELECT COUNT(DISTINCT accession) FROM gse_mesh")).scalar() or 0
+        tagged_pct = round(tagged / gse_count * 100, 1) if gse_count > 0 else 0
+        pg_status = "✅ Connected"
+    except Exception:
+        pg_host, pg_port, pg_db = "postgres", 5432, "geosearch"
+        gse_count = mesh_count = tag_count = od_count = tagged = 0
+        od_pct = tagged_pct = 0
+        pg_status = "❌ Disconnected"
 
-    3. **Start with Smaller Batches**
-       - Test with 50-100 records first
-       - Gradually increase after confirming it works
-       - Large batches (10000+) may take considerable time
+    _section("🐘 PostgreSQL Database", [
+        _row("Host", f"{pg_host}:{pg_port}"),
+        _row("Database", pg_db),
+        _row("GSE Series", f"{gse_count:,}"),
+        _row("MeSH Terms Loaded", f"{mesh_count:,}"),
+        _row("MeSH Tags (gse_mesh)", f"{tag_count:,}"),
+        _row("Series MeSH Tagged", f"{tagged:,} ({tagged_pct}%)"),
+        _row("With overall_design", f"{od_count:,} ({od_pct}%)"),
+        _row("Status", pg_status),
+    ])
 
-    4. **Use Specific Queries**
-       - More specific queries return better results
-       - Example: "breast cancer RNA-seq GPL570"
-       - vs. just "cancer" (too broad)
-    """
-    )
+    # ── Search Settings ───────────────────────────────────────────────────────
+    semantic_top_k = getattr(settings, "semantic_top_k", 100)
+    lexical_top_k  = getattr(settings, "lexical_top_k", 100)
+
+    _section("🔍 Search Settings", [
+        _row("Semantic Top-K", semantic_top_k),
+        _row("Lexical Top-K", lexical_top_k),
+        _row("Min Score (primary)", "0.65"),
+        _row("Min Score (fallback)", "0.60"),
+        _row("MeSH Expansion Cap", "Top 5 terms"),
+        _row("RRF k-parameter", "60"),
+        _row("MeSH Boost per tag", "+0.1"),
+        _row("MeSH Boost cap", "+0.5 max"),
+    ])
+
+    # ── NCBI API ──────────────────────────────────────────────────────────────
+    rate = 10.0 if getattr(settings, "ncbi_api_key", None) else 3.0
+    _section("🔬 NCBI API", [
+        _row("Email", settings.ncbi_email or "Not set"),
+        _row("API Key", "✅ Set" if getattr(settings, "ncbi_api_key", None) else "❌ Not set"),
+        _row("Rate Limit", f"{rate} req/s"),
+        _row("Base URL", "eutils.ncbi.nlm.nih.gov"),
+    ])
+
+    # ── LLM / RAG ─────────────────────────────────────────────────────────────
+    ollama_host  = getattr(settings, "ollama_host", "ollama")
+    ollama_port  = getattr(settings, "ollama_port", 11434)
+    ollama_model = getattr(settings, "ollama_model", "llama3")
+    try:
+        import requests as _req
+        r = _req.get(f"http://{ollama_host}:{ollama_port}/api/tags", timeout=3)
+        ollama_status = "✅ Running"
+    except Exception:
+        ollama_status = "❌ Offline"
+
+    _section("🤖 LLM / RAG (Ollama)", [
+        _row("Host", f"{ollama_host}:{ollama_port}"),
+        _row("Model", ollama_model),
+        _row("Status", ollama_status),
+    ])
 
     # Database statistics
     st.markdown("**Database Statistics:**")

@@ -15,7 +15,8 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-geouser} -d ${POSTGRES_DB:-geosearch}"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
     networks:
       - geosearch-network
