@@ -14,38 +14,14 @@ from db import MeshTerm, get_db
 logger = logging.getLogger(__name__)
 
 
-# Top-level MeSH descriptors that are too broad to use for query expansion.
-# These match almost every biomedical dataset and inflate result counts dramatically.
-# e.g. D009369 "Neoplasms" matches all cancers; D007231 "Infant, Newborn" matches all neonatal studies.
-OVERLY_BROAD_MESH_IDS: set[str] = {
-    "D009369",  # Neoplasms (all cancers)
-    "D006801",  # Humans
-    "D000818",  # Animals
-    "D051379",  # Mice
-    "D007231",  # Infant, Newborn
-    "D008297",  # Male
-    "D005260",  # Female
-    "D000368",  # Aged
-    "D000293",  # Adolescent
-    "D000328",  # Adult
-    "D008875",  # Middle Aged
-    "D005243",  # Feces (too broad for most queries)
-}
-
-# Lay terms that have NO MeSH entry_terms mapping — verified gaps in MeSH vocabulary.
-# Only add terms here after confirming they don't appear in mesh_term.entry_terms.
+# Common lay terms mapped to MeSH-like wording to improve recall.
 LAY_TERM_ALIASES: dict[str, list[str]] = {
-    # "throat" only maps to Pharyngitis/Pharynx in MeSH — no cancer mapping
-    "throat cancer": ["head and neck neoplasms", "oropharyngeal neoplasms",
-                      "laryngeal neoplasms", "nasopharyngeal carcinoma",
-                      "squamous cell carcinoma of head and neck"],
-    "throat": ["pharynx", "oropharynx", "larynx", "nasopharynx"],
-    # "heart attack" not in MeSH entry_terms
+    "cancer": ["neoplasm", "neoplasms", "carcinoma", "tumor", "tumour"],
     "heart attack": ["myocardial infarction", "cardiac infarction"],
-    # "high blood pressure" not a MeSH entry term
+    "stroke": ["cerebrovascular accident", "brain ischemia"],
     "high blood pressure": ["hypertension"],
-    # "blood cancer" not in MeSH
-    "blood cancer": ["leukemia", "lymphoma", "multiple myeloma", "hematologic neoplasms"],
+    "kidney failure": ["renal failure"],
+    "liver cancer": ["hepatocellular carcinoma", "liver neoplasms", "hepatoma"],
 }
 
 
@@ -206,8 +182,6 @@ class QueryExpander:
         def _add(term: MeshTerm, priority: int) -> None:
             if term.mesh_id in seen_ids:
                 return
-            if term.mesh_id in OVERLY_BROAD_MESH_IDS:
-                return
             seen_ids.add(term.mesh_id)
             matches.append({
                 "mesh_id": term.mesh_id,
@@ -218,14 +192,8 @@ class QueryExpander:
             })
 
         # Pass 1: exact preferred name match (highest priority)
-        # Single short words like "breast", "heart", "lung" are anatomical terms
-        # that match too broadly — require either multi-word tokens or longer words (>=8 chars)
         for token in tokens:
             if len(token) < 3:
-                continue
-            is_multiword = " " in token
-            is_specific = len(token) >= 8
-            if not is_multiword and not is_specific:
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name) == token.lower()
@@ -233,9 +201,9 @@ class QueryExpander:
             for t in results:
                 _add(t, 0)
 
-        # Pass 2: exact entry term match — allow single words >= 6 chars
+        # Pass 2: exact entry term match
         for token in tokens:
-            if len(token) < 6:
+            if len(token) < 3:
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(func.cast(MeshTerm.entry_terms, String)).like(
@@ -245,10 +213,9 @@ class QueryExpander:
             for t in results:
                 _add(t, 1)
 
-        # Pass 3: preferred name starts with token
-        # Allow multi-word tokens OR long single words (>=8 chars) to catch "diabetes" → "Diabetes Mellitus"
+        # Pass 3: preferred name starts with token (longer tokens only)
         for token in tokens:
-            if len(token) < 8 and " " not in token:
+            if len(token) < 5:
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"{token.lower()}%")
@@ -256,10 +223,9 @@ class QueryExpander:
             for t in results:
                 _add(t, 2)
 
-        # Pass 4: partial preferred name match — multi-word tokens only to prevent
-        # single adjectives like "pancreatic" matching unrelated descriptors
+        # Pass 4: partial preferred name match (fallback)
         for token in tokens:
-            if len(token) < 5 or " " not in token:
+            if len(token) < 5:
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"%{token.lower()}%")
@@ -267,9 +233,9 @@ class QueryExpander:
             for t in results:
                 _add(t, 3)
 
-        # Pass 5: partial entry term match — multi-word only (lay-term fallback)
+        # Pass 5: partial entry term match (lay-term fallback)
         for token in tokens:
-            if len(token) < 6 or " " not in token:
+            if len(token) < 4:
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(func.cast(MeshTerm.entry_terms, String)).like(

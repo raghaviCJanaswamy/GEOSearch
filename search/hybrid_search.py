@@ -165,10 +165,23 @@ class HybridSearchEngine:
         top_k: int = 0,  # unused — kept for signature compat
     ) -> list[dict[str, Any]]:
         """
-        Perform lexical search using PostgreSQL full-text search.
-        Original query and each MeSH term are OR'd so that expansion
-        terms don't require AND-matching across all words.
+        Perform lexical/keyword search using PostgreSQL full-text search.
+        Uses tsvector/tsquery which is index-backed and far faster than LIKE.
+
+        Args:
+            query: Search query
+            filters: Structured filters
+            top_k: Number of results
+
+        Returns:
+            List of results with accession and relevance score
         """
+        # Convert query to a PostgreSQL websearch tsquery (handles phrases, AND, OR)
+        # Falls back to plain to_tsquery if empty after stripping short tokens
+        tsquery = func.websearch_to_tsquery("english", query)
+
+        # Build a weighted tsvector over title (A), summary (B), overall_design (C)
+        # setweight gives title matches a higher rank than summary matches
         tsvec = func.setweight(
             func.to_tsvector("english", func.coalesce(GSESeries.title, "")), "A"
         ).op("||")(
@@ -181,74 +194,8 @@ class HybridSearchEngine:
             )
         )
 
-        # Build tsquery strategy:
-        # 1. Original query as a whole phrase AND (plainto_tsquery) — most precise
-        # 2. Per-word prefix tsquery AND'd together — catches stemming variants:
-        #    "pancreatic cancer" query matches records saying "pancreas cancer"
-        #    because to_tsquery('pancrea:*') matches both pancreas and pancreatic
-        # 3. Each MeSH preferred name OR'd in as an additional match pathway
-        # Result: (phrase OR prefix_word1 & prefix_word2 OR MeSH1 OR MeSH2 ...)
-        original_tsquery = func.plainto_tsquery("english", query)
-
-        # Build per-word prefix AND query (catches stemming variants like pancreas/pancreatic)
-        query_words = [w.strip("\"'(),.") for w in query.split() if len(w.strip("\"'(),.")) >= 3]
-        if len(query_words) > 1:
-            # Use prefix matching: 'pancreatic' → 'pancrea:*' catches pancreas/pancreatic
-            prefix_parts = " & ".join(f"{w[:6]}:*" for w in query_words)
-            prefix_tsquery = func.to_tsquery("english", prefix_parts)
-            combined_tsquery = original_tsquery.op("||")(prefix_tsquery)
-        else:
-            combined_tsquery = original_tsquery
-
-        # Cancer-domain synonym expansion: if query contains a cancer term, also match
-        # records using alternative oncology vocabulary (tumor, neoplasm, carcinoma, PDAC etc.)
-        # that NCBI catches via PubMed MeSH linkage but we don't have sample-level metadata for.
-        CANCER_SYNONYMS = {"cancer", "tumor", "tumour", "neoplas", "carcinoma", "malignancy", "adenocarcinoma"}
-        query_lower = query.lower()
-        has_cancer_term = any(syn in query_lower for syn in CANCER_SYNONYMS)
-        has_organ_term = any(
-            w for w in query_words
-            if w.lower() not in CANCER_SYNONYMS and len(w) >= 4
-        )
-        if has_cancer_term and has_organ_term:
-            organ_words = [w for w in query_words if w.lower() not in CANCER_SYNONYMS and len(w) >= 4]
-            # Use up to 8 chars for organ prefix to reduce false matches (e.g. pancrea:* → pancreatic/pancreas only)
-            organ_prefix = " & ".join(f"{w[:8]}:*" for w in organ_words)
-            cancer_variants = "cancer:* | tumor:* | neoplas:* | carcinoma:* | adenocarcinoma:* | malign:*"
-            expanded_parts = f"({organ_prefix}) & ({cancer_variants})"
-            try:
-                expanded_tsquery = func.to_tsquery("english", expanded_parts)
-                combined_tsquery = combined_tsquery.op("||")(expanded_tsquery)
-            except Exception:
-                pass  # fallback: skip expansion if tsquery syntax fails
-
-        # OR in each MeSH preferred name as a whole phrase.
-        # This is critical for lay-term queries like "heart attack" where the original
-        # words don't appear in clinical papers — the MeSH terms drive lexical recall.
-        for mt in (mesh_terms or []):
-            mt_cleaned = mt.strip("\"'(),.")
-            if len(mt_cleaned) >= 3:
-                combined_tsquery = combined_tsquery.op("||")(
-                    func.plainto_tsquery("english", mt_cleaned)
-                )
-                # Add prefix variant only for long clinical words not already in the query
-                # e.g. "Myocardial Infarction" → "myocard:*" catches myocardial/myocardium
-                # Skip short anatomy words like "lung", "small" that over-match
-                mt_words = mt_cleaned.split()
-                query_words_lower = query.lower().split()
-                if (len(mt_words) >= 2
-                        and len(mt_words[0]) >= 8
-                        and mt_words[0].lower() not in query_words_lower):
-                    prefix = mt_words[0][:7].lower()
-                    try:
-                        combined_tsquery = combined_tsquery.op("||")(
-                            func.to_tsquery("english", f"{prefix}:*")
-                        )
-                    except Exception:
-                        pass
-
-        ts_rank = func.ts_rank(tsvec, combined_tsquery)
-        ts_match = tsvec.op("@@")(combined_tsquery)
+        ts_rank = func.ts_rank(tsvec, tsquery)
+        ts_match = tsvec.op("@@")(tsquery)
 
         filter_conditions = self._build_filter_conditions(filters)
         base_filter = and_(ts_match, *filter_conditions) if filter_conditions else ts_match
@@ -257,6 +204,7 @@ class HybridSearchEngine:
             self.db.query(GSESeries.accession, ts_rank.label("rank"))
             .filter(base_filter)
             .order_by(ts_rank.desc())
+            .limit(top_k)
             .all()
         )
 

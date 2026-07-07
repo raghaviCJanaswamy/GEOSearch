@@ -22,72 +22,44 @@ class MeSHMatcher:
 
     # Class-level cache so MeSH terms are only loaded once per process
     _term_lookup_cache: dict[str, list[str]] | None = None
-    _single_lookup_cache: dict[str, list[tuple[str, float]]] | None = None
-    _phrase_by_first_word_cache: dict[str, dict[str, list[str]]] | None = None
+
+    def __init__(self, db: Session):
+        """
+        Initialize matcher.
 
     def __init__(self, db: Session):
         self.db = db
+
+        # Load MeSH terms into memory for faster matching (cached at class level)
         if MeSHMatcher._term_lookup_cache is None:
             self._load_mesh_terms()
-        self.term_lookup          = MeSHMatcher._term_lookup_cache
-        self.single_lookup        = MeSHMatcher._single_lookup_cache
-        self.phrase_by_first_word = MeSHMatcher._phrase_by_first_word_cache
+        self.term_lookup = MeSHMatcher._term_lookup_cache
 
     def _load_mesh_terms(self) -> None:
-        """Load MeSH terms into two structures for fast matching:
-        - term_lookup: exact phrase -> [mesh_id]  (for substring search)
-        - single_lookup: single_word -> [(mesh_id, confidence)]  (for token lookup)
-        """
+        """Load all MeSH terms from database into class-level cache."""
         logger.info("Loading MeSH terms for matching...")
         terms = self.db.query(MeshTerm).all()
 
+        # Build lookup dictionary: term_text -> mesh_id
         term_lookup: dict[str, list[str]] = {}
-        # single-word token index: word -> list of (mesh_id, base_confidence)
-        single_lookup: dict[str, list[tuple[str, float]]] = {}
 
         for term in terms:
-            all_names = [term.preferred_name]
+            # Add preferred name
+            preferred = term.preferred_name.lower()
+            if preferred not in term_lookup:
+                term_lookup[preferred] = []
+            term_lookup[preferred].append(term.mesh_id)
+
+            # Add entry terms (synonyms)
             if term.entry_terms:
-                all_names.extend(term.entry_terms)
-
-            for name in all_names:
-                name_lower = name.lower().strip()
-                if len(name_lower) < 4:
-                    continue
-                words = name_lower.split()
-                n = len(words)
-
-                # Store full phrase for substring matching
-                if name_lower not in term_lookup:
-                    term_lookup[name_lower] = []
-                term_lookup[name_lower].append(term.mesh_id)
-
-                # For single-word terms, also index by the word token
-                if n == 1 and len(name_lower) >= 5:
-                    if name_lower not in single_lookup:
-                        single_lookup[name_lower] = []
-                    single_lookup[name_lower].append((term.mesh_id, 0.4))
-
-        # Build first-word index for multi-word phrases only
-        phrase_by_first_word: dict[str, dict[str, list[str]]] = {}
-        for phrase, mesh_ids in term_lookup.items():
-            if " " not in phrase:
-                continue  # single-word handled by single_lookup
-            first = phrase.split()[0]
-            if len(first) < 4:
-                continue
-            if first not in phrase_by_first_word:
-                phrase_by_first_word[first] = {}
-            phrase_by_first_word[first][phrase] = mesh_ids
+                for entry in term.entry_terms:
+                    entry_lower = entry.lower()
+                    if entry_lower not in term_lookup:
+                        term_lookup[entry_lower] = []
+                    term_lookup[entry_lower].append(term.mesh_id)
 
         MeSHMatcher._term_lookup_cache = term_lookup
-        MeSHMatcher._single_lookup_cache = single_lookup
-        MeSHMatcher._phrase_by_first_word_cache = phrase_by_first_word
-        logger.info(
-            f"Loaded {len(terms)} MeSH terms: "
-            f"{len(term_lookup)} phrase variants, {len(single_lookup)} single-word tokens, "
-            f"{len(phrase_by_first_word)} first-word index entries"
-        )
+        logger.info(f"Loaded {len(terms)} MeSH terms with {len(term_lookup)} searchable variants")
 
     def match_gse(
         self,

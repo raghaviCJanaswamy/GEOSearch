@@ -16,22 +16,18 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # --- Pre-download embedding model so it is baked into the image ---
-# Create appuser first so we can cache the model into their home directory.
-RUN useradd -m -u 1000 appuser
-
-ENV HF_HUB_OFFLINE=0
-RUN mkdir -p /home/appuser/.cache \
-    && HOME=/home/appuser python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-mpnet-base-v2')" \
-    && chown -R appuser:appuser /home/appuser/.cache
-
-# At runtime, use the baked-in cache — never phone home to HuggingFace.
-ENV HF_HUB_OFFLINE=1
-ENV TRANSFORMERS_OFFLINE=1
+# This avoids a ~90MB runtime download on every cold start.
+RUN python -c "\
+from sentence_transformers import SentenceTransformer; \
+SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
 
 # --- Application code (changes frequently — kept last to preserve cache above) ---
 COPY . .
 
-RUN mkdir -p logs && chown -R appuser:appuser /app
+# Run as non-root user to reduce attack surface
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p logs && \
+    chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 8501 8080
