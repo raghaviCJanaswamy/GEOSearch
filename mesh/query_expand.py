@@ -32,6 +32,27 @@ OVERLY_BROAD_MESH_IDS: set[str] = {
     "D005243",  # Feces (too broad for most queries)
 }
 
+# Generic modifier words that must NOT drive MeSH expansion on their own.
+# These words appear as prefixes/substrings in hundreds of MeSH descriptors
+# (e.g. "treatment" → Treatment Failure, Treatment Outcome, Therapeutics…)
+# and produce massively over-broad result sets when used as standalone tokens.
+# They are only meaningful when part of a multi-word phrase that is already
+# handled by the bigram/trigram tokenisation paths.
+GENERIC_MODIFIER_WORDS: frozenset[str] = frozenset({
+    "treatment", "therapy", "therapies", "therapeutic",
+    "management", "intervention", "procedure", "approach",
+    "analysis", "study", "studies", "research", "investigation",
+    "effect", "effects", "response", "outcome", "outcomes",
+    "mechanism", "mechanisms", "pathway", "pathways",
+    "regulation", "expression", "function", "activity",
+    "disorder", "disease", "syndrome", "condition",
+    "patient", "patients", "subject", "subjects",
+    "human", "humans", "animal", "animals",
+    "model", "models", "method", "methods",
+    "protein", "proteins", "gene", "genes",
+    "cell", "cells", "tissue", "tissues",
+})
+
 # Lay terms that have NO MeSH entry_terms mapping — verified gaps in MeSH vocabulary.
 # Only add terms here after confirming they don't appear in mesh_term.entry_terms.
 LAY_TERM_ALIASES: dict[str, list[str]] = {
@@ -97,7 +118,7 @@ class QueryExpander:
         tokens = self._add_alias_tokens(query, tokens)
 
         # Find matching MeSH terms
-        matched_terms = self._find_matching_mesh_terms(tokens, max_terms)
+        matched_terms = self._find_matching_mesh_terms(tokens, max_terms, query)
 
         if not matched_terms:
             logger.info("No MeSH terms matched")
@@ -189,6 +210,7 @@ class QueryExpander:
         self,
         tokens: list[str],
         max_terms: int,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         """
         Find MeSH terms matching query tokens.
@@ -217,6 +239,10 @@ class QueryExpander:
                 "_priority": priority,
             })
 
+        def _is_generic_single(token: str) -> bool:
+            """Return True if this is a bare generic word that must not drive MeSH lookup."""
+            return " " not in token and token.lower() in GENERIC_MODIFIER_WORDS
+
         # Pass 1: exact preferred name match (highest priority)
         # Single short words like "breast", "heart", "lung" are anatomical terms
         # that match too broadly — require either multi-word tokens or longer words (>=8 chars)
@@ -226,6 +252,8 @@ class QueryExpander:
             is_multiword = " " in token
             is_specific = len(token) >= 8
             if not is_multiword and not is_specific:
+                continue
+            if _is_generic_single(token):
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name) == token.lower()
@@ -237,6 +265,8 @@ class QueryExpander:
         for token in tokens:
             if len(token) < 6:
                 continue
+            if _is_generic_single(token):
+                continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(func.cast(MeshTerm.entry_terms, String)).like(
                     f'%"{token.lower()}"%'
@@ -247,13 +277,21 @@ class QueryExpander:
 
         # Pass 3: preferred name starts with token
         # Allow multi-word tokens OR long single words (>=8 chars) to catch "diabetes" → "Diabetes Mellitus"
+        # Only accept results where the preferred name either equals the token or continues
+        # with a space (e.g. token "breast neoplasms" → "Breast Neoplasms Male" ok,
+        # "Breast Neoplasms, Male" NOT ok — comma-qualified variants require explicit query match).
         for token in tokens:
             if len(token) < 8 and " " not in token:
+                continue
+            if _is_generic_single(token):
                 continue
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"{token.lower()}%")
             ).limit(max_terms).all()
             for t in results:
+                remainder = t.preferred_name.lower()[len(token):]
+                if remainder and not remainder.startswith(" "):
+                    continue  # comma/punctuation qualifier not in query — skip
                 _add(t, 2)
 
         # Pass 4: partial preferred name match — multi-word tokens only to prevent
@@ -267,6 +305,19 @@ class QueryExpander:
             for t in results:
                 _add(t, 3)
 
+        def _has_unqueried_comma_qualifier(term: MeshTerm, query_lower: str) -> bool:
+            """Return True if the preferred name has a ', Qualifier' suffix whose
+            qualifier word does not appear in the original query.
+            e.g. 'Breast Neoplasms, Male' when query is 'breast cancer' → True (skip).
+            """
+            name = term.preferred_name.lower()
+            if "," not in name:
+                return False
+            qualifier = name.split(",", 1)[1].strip()
+            return qualifier not in query_lower
+
+        query_lower_full = query.lower()
+
         # Pass 5: partial entry term match — multi-word only (lay-term fallback)
         for token in tokens:
             if len(token) < 6 or " " not in token:
@@ -277,6 +328,8 @@ class QueryExpander:
                 )
             ).limit(max_terms).all()
             for t in results:
+                if _has_unqueried_comma_qualifier(t, query_lower_full):
+                    continue
                 _add(t, 4)
 
         # Sort by priority then return top max_terms
