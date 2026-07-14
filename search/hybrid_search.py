@@ -94,17 +94,27 @@ class HybridSearchEngine:
                     top_k=settings.semantic_top_k,
                     min_score=0.65,
                 )
-                # If too few results, the query may be a lay term whose embedding
-                # lands far from clinical vocabulary — relax threshold to recover recall
+                # Progressively relax threshold for niche/rare-disease queries
+                # whose embeddings naturally score lower than common biomedical terms
                 if len(semantic_results) < 50:
                     semantic_results = semantic_search(
                         query=expanded_query,
                         top_k=settings.semantic_top_k,
                         min_score=0.60,
                     )
-                    logger.info(f"Semantic search (relaxed threshold): {len(semantic_results)} results")
-                else:
-                    logger.info(f"Semantic search: {len(semantic_results)} results")
+                if len(semantic_results) < 20:
+                    semantic_results = semantic_search(
+                        query=expanded_query,
+                        top_k=settings.semantic_top_k,
+                        min_score=0.50,
+                    )
+                if len(semantic_results) < 5:
+                    semantic_results = semantic_search(
+                        query=expanded_query,
+                        top_k=settings.semantic_top_k,
+                        min_score=0.45,
+                    )
+                logger.info(f"Semantic search: {len(semantic_results)} results")
             except Exception as e:
                 logger.error(f"Semantic search failed: {e}", exc_info=True)
                 # Continue without semantic results
@@ -125,14 +135,24 @@ class HybridSearchEngine:
             )
             logger.info(f"Lexical search: {len(lexical_results)} results")
 
-        # Step 4: Combine results using RRF
+        # Step 4: MeSH-only retrieval — fetch datasets directly tagged with matched
+        # MeSH IDs. This is the primary retrieval path when use_mesh=True and the
+        # query term is a precise MeSH descriptor (e.g. "Vitiligo") that may not
+        # appear verbatim in dataset text but IS stored in the gse_mesh table.
+        mesh_only_results = []
+        if use_mesh and matched_mesh_ids:
+            mesh_only_results = self._mesh_only_search(matched_mesh_ids, filters)
+            logger.info(f"MeSH-only search: {len(mesh_only_results)} results")
+
+        # Step 5: Combine results using RRF
         combined_results = self._reciprocal_rank_fusion(
             semantic_results=semantic_results,
             lexical_results=lexical_results,
+            mesh_only_results=mesh_only_results,
             matched_mesh_ids=matched_mesh_ids,
         )
 
-        # Step 5: Apply filters and fetch full metadata — no cap, return all matches
+        # Step 6: Apply filters and fetch full metadata — no cap, return all matches
         final_results = self._fetch_and_filter_results(
             ranked_accessions=combined_results,
             filters=filters,
@@ -146,6 +166,7 @@ class HybridSearchEngine:
             "mesh_terms": expansion_result["matched_terms"] if expansion_result else [],
             "semantic_count": len(semantic_results),
             "lexical_count": len(lexical_results),
+            "mesh_count": len(mesh_only_results),
             "total_results": len(final_results),
             "filters_applied": filters,
         }
@@ -308,11 +329,32 @@ class HybridSearchEngine:
 
         return conditions
 
+    def _mesh_only_search(
+        self,
+        matched_mesh_ids: list[str],
+        filters: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieve datasets directly tagged with matched MeSH IDs.
+        This is the primary retrieval path when the query is a precise MeSH
+        descriptor (e.g. "Vitiligo") — the term may not appear in dataset text
+        but IS stored as a gse_mesh association.
+        """
+        rows = (
+            self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+            .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+            .group_by(GSEMesh.accession)
+            .order_by(func.count(GSEMesh.mesh_id).desc())
+            .all()
+        )
+        return [{"accession": accession, "score": float(count)} for accession, count in rows]
+
     def _reciprocal_rank_fusion(
         self,
         semantic_results: list[dict[str, Any]],
         lexical_results: list[dict[str, Any]],
         matched_mesh_ids: list[str],
+        mesh_only_results: list[dict[str, Any]] | None = None,
         k: int | None = None,
     ) -> list[str]:
         """
@@ -324,6 +366,7 @@ class HybridSearchEngine:
             semantic_results: Results from semantic search
             lexical_results: Results from lexical search
             matched_mesh_ids: MeSH IDs matched in query expansion
+            mesh_only_results: Results from direct MeSH tag lookup
             k: RRF constant (default: from settings)
 
         Returns:
@@ -342,6 +385,12 @@ class HybridSearchEngine:
 
         # Add lexical results
         for rank, result in enumerate(lexical_results, start=1):
+            accession = result["accession"]
+            rrf_score = 1.0 / (k + rank)
+            scores[accession] = scores.get(accession, 0.0) + rrf_score
+
+        # Add MeSH-only results (direct tag lookup)
+        for rank, result in enumerate(mesh_only_results or [], start=1):
             accession = result["accession"]
             rrf_score = 1.0 / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
