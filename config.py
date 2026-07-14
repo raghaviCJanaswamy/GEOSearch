@@ -53,7 +53,11 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"         # model tag pulled in Ollama
 
     # Search
-    semantic_top_k: int = 100
+    semantic_top_k: int = 500   # Milvus candidates — raised from 100 so more datasets
+                                 # are scored before the min_score filter is applied.
+                                 # Critical for common queries like "breast cancer" where
+                                 # thousands of relevant datasets exist but cosine similarity
+                                 # scores are spread across a wide range.
     lexical_top_k: int = 100
     final_top_k: int = 50
     rrf_k: int = 60  # Reciprocal Rank Fusion constant

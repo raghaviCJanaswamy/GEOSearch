@@ -94,21 +94,24 @@ class HybridSearchEngine:
                     top_k=settings.semantic_top_k,
                     min_score=0.65,
                 )
-                # Progressively relax threshold for niche/rare-disease queries
-                # whose embeddings naturally score lower than common biomedical terms
+                # Progressively relax threshold to maximise recall.
+                # Common queries like "breast cancer" score mostly in the 0.45-0.55
+                # range against verbose clinical GEO text, so we always reach 0.45.
+                # Niche queries may still get few results even at 0.45 — that is
+                # expected; keyword and MeSH modes cover the remaining recall gap.
                 if len(semantic_results) < 50:
                     semantic_results = semantic_search(
                         query=expanded_query,
                         top_k=settings.semantic_top_k,
                         min_score=0.60,
                     )
-                if len(semantic_results) < 20:
+                if len(semantic_results) < 50:
                     semantic_results = semantic_search(
                         query=expanded_query,
                         top_k=settings.semantic_top_k,
                         min_score=0.50,
                     )
-                if len(semantic_results) < 5:
+                if len(semantic_results) < 50:
                     semantic_results = semantic_search(
                         query=expanded_query,
                         top_k=settings.semantic_top_k,
