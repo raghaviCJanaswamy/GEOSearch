@@ -17,7 +17,6 @@ from pymilvus import (
 )
 
 from config import settings
-from vector.embeddings import get_embedding_provider
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,8 @@ class MilvusStore:
         self.port = port or settings.milvus_port
         self.collection_name = collection_name or settings.milvus_collection_name
 
-        # Get embedding dimension
-        embedding_provider = get_embedding_provider()
-        self.dimension = embedding_provider.get_dimension()
+        # Read dimension from settings — avoids loading the embedding model just for this value.
+        self.dimension = settings.embedding_dimension
 
         logger.info(
             f"Initializing Milvus store: {self.host}:{self.port}, "
@@ -59,6 +57,15 @@ class MilvusStore:
 
         # Ensure collection exists
         self._ensure_collection()
+
+        # Warn when the collection is large enough that FLAT index becomes slow.
+        # IVF_FLAT is recommended above ~100K vectors — rebuild the index manually.
+        count = self.count()
+        if count > 100_000:
+            logger.warning(
+                f"Collection '{self.collection_name}' has {count:,} vectors and uses a FLAT index. "
+                "Consider rebuilding with IVF_FLAT for faster search at this scale."
+            )
 
     def _connect(self) -> None:
         """Connect to Milvus server."""
@@ -187,7 +194,10 @@ class MilvusStore:
             ]
 
             self.collection.upsert(data)
-            self.collection.flush()
+            # flush() is intentionally omitted here — callers that ingest
+            # large batches should call collection.flush() once at the end
+            # to avoid blocking on every batch. Search still works against
+            # in-memory (unsealed) segments without an explicit flush.
 
             logger.info(f"Successfully upserted {len(embeddings)} embeddings")
 
@@ -225,7 +235,7 @@ class MilvusStore:
 
         search_params = {
             "metric_type": "IP",  # Inner Product
-            "params": {"nprobe": 10},
+            "params": {},  # nprobe is IVF-only; FLAT index ignores it
         }
 
         logger.debug(f"Searching Milvus: top_k={top_k}, filter={filter_expr}")

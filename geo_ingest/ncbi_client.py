@@ -321,9 +321,9 @@ class NCBIClient:
             "n_samples": get_text(docsum.find(".//n_samples")),
         }
 
-        # Extract sample organisms
+        # Extract sample organisms, preserving first-seen order
         samples = docsum.findall(".//Sample")
-        organisms = list(set(get_text(s.find(".//Organism")) for s in samples))
+        organisms = list(dict.fromkeys(get_text(s.find(".//Organism")) for s in samples))
         data["organisms"] = [org for org in organisms if org]
 
         # Contact/contributor

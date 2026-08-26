@@ -6,10 +6,10 @@ import logging
 import re
 from typing import Any
 
-from sqlalchemy import String, func, or_
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from db import MeshTerm, get_db
+from db import MeshTerm, SessionLocal
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +225,10 @@ class QueryExpander:
         seen_ids: set[str] = set()
         matches: list[dict[str, Any]] = []
 
+        # Track which source token each match came from so the caller can
+        # group matches by concept and require intersection across groups.
+        current_token: list[str] = [""]
+
         def _add(term: MeshTerm, priority: int) -> None:
             if term.mesh_id in seen_ids:
                 return
@@ -236,6 +240,7 @@ class QueryExpander:
                 "preferred_name": term.preferred_name,
                 "entry_terms": term.entry_terms or [],
                 "descriptor_ui": term.descriptor_ui,
+                "source_token": current_token[0],
                 "_priority": priority,
             })
 
@@ -255,24 +260,37 @@ class QueryExpander:
                 continue
             if _is_generic_single(token):
                 continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name) == token.lower()
             ).all()
             for t in results:
                 _add(t, 0)
 
-        # Pass 2: exact entry term match — allow single words >= 6 chars
+        # Pass 2: exact entry term match — allow single words >= 6 chars.
+        # Uses a lateral join because jsonb_array_elements_text is a set-returning function
+        # and cannot appear in a WHERE clause directly.
         for token in tokens:
             if len(token) < 6:
                 continue
             if _is_generic_single(token):
                 continue
-            results = self.db.query(MeshTerm).filter(
-                func.lower(func.cast(MeshTerm.entry_terms, String)).like(
-                    f'%"{token.lower()}"%'
+            current_token[0] = token
+            rows = self.db.execute(
+                text("""
+                    SELECT mesh_id, descriptor_ui, preferred_name, entry_terms, tree_numbers, created_at
+                    FROM mesh_term,
+                         jsonb_array_elements_text(entry_terms) AS et
+                    WHERE lower(et) = :token
+                    LIMIT :lim
+                """),
+                {"token": token.lower(), "lim": max_terms},
+            ).fetchall()
+            for row in rows:
+                t = MeshTerm(
+                    mesh_id=row[0], descriptor_ui=row[1], preferred_name=row[2],
+                    entry_terms=row[3], tree_numbers=row[4], created_at=row[5],
                 )
-            ).limit(max_terms).all()
-            for t in results:
                 _add(t, 1)
 
         # Pass 3: preferred name starts with token
@@ -285,6 +303,7 @@ class QueryExpander:
                 continue
             if _is_generic_single(token):
                 continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"{token.lower()}%")
             ).limit(max_terms).all()
@@ -299,6 +318,7 @@ class QueryExpander:
         for token in tokens:
             if len(token) < 5 or " " not in token:
                 continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"%{token.lower()}%")
             ).limit(max_terms).all()
@@ -318,16 +338,28 @@ class QueryExpander:
 
         query_lower_full = query.lower()
 
-        # Pass 5: partial entry term match — multi-word only (lay-term fallback)
+        # Pass 5: partial entry term match — multi-word only (lay-term fallback).
+        # Uses a lateral join because jsonb_array_elements_text is a set-returning function
+        # and cannot appear in a WHERE clause directly.
         for token in tokens:
             if len(token) < 6 or " " not in token:
                 continue
-            results = self.db.query(MeshTerm).filter(
-                func.lower(func.cast(MeshTerm.entry_terms, String)).like(
-                    f"%{token.lower()}%"
+            current_token[0] = token
+            rows = self.db.execute(
+                text("""
+                    SELECT mesh_id, descriptor_ui, preferred_name, entry_terms, tree_numbers, created_at
+                    FROM mesh_term,
+                         jsonb_array_elements_text(entry_terms) AS et
+                    WHERE lower(et) LIKE :pattern
+                    LIMIT :lim
+                """),
+                {"pattern": f"%{token.lower()}%", "lim": max_terms},
+            ).fetchall()
+            for row in rows:
+                t = MeshTerm(
+                    mesh_id=row[0], descriptor_ui=row[1], preferred_name=row[2],
+                    entry_terms=row[3], tree_numbers=row[4], created_at=row[5],
                 )
-            ).limit(max_terms).all()
-            for t in results:
                 if _has_unqueried_comma_qualifier(t, query_lower_full):
                     continue
                 _add(t, 4)
@@ -351,8 +383,7 @@ def expand_query_simple(query: str, db: Session | None = None) -> str:
         Expanded query string
     """
     if db is None:
-        db_gen = get_db()
-        db = next(db_gen)
+        db = SessionLocal()
         close_db = True
     else:
         close_db = False

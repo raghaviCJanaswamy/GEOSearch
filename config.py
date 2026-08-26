@@ -39,7 +39,7 @@ class Settings(BaseSettings):
 
     # Embeddings
     embedding_provider: Literal["local", "openai"] = "local"
-    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    embedding_model: str = "NeuML/pubmedbert-base-embeddings"
     embedding_dimension: int = 768
 
     # OpenAI
@@ -61,6 +61,9 @@ class Settings(BaseSettings):
     lexical_top_k: int = 100
     final_top_k: int = 50
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
+
+    # MeSH tagging
+    mesh_confidence_threshold: float = 0.3
 
     # Logging
     log_level: str = "INFO"

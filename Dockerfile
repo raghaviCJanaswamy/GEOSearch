@@ -21,7 +21,7 @@ RUN useradd -m -u 1000 appuser
 
 ENV HF_HUB_OFFLINE=0
 RUN mkdir -p /home/appuser/.cache \
-    && HOME=/home/appuser python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('sentence-transformers/all-mpnet-base-v2')" \
+    && HOME=/home/appuser python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('NeuML/pubmedbert-base-embeddings')" \
     && chown -R appuser:appuser /home/appuser/.cache
 
 # At runtime, use the baked-in cache — never phone home to HuggingFace.

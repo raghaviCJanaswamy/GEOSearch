@@ -6,7 +6,6 @@ import logging
 import re
 from typing import Any
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from db.models import GSEMesh, GSESeries, MeshTerm

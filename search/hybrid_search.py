@@ -4,15 +4,13 @@ Implements Reciprocal Rank Fusion (RRF) for result merging.
 """
 import logging
 import re
-from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, and_, cast, func, or_, text
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy import String, and_, func, or_
 from sqlalchemy.orm import Session
 
 from config import settings
-from db import GSEMesh, GSESeries, MeshTerm, get_db
+from db import GSEMesh, GSESeries, MeshTerm, SessionLocal
 from mesh.query_expand import QueryExpander
 from vector.search import semantic_search
 
@@ -41,7 +39,6 @@ class HybridSearchEngine:
         use_semantic: bool = True,
         use_lexical: bool = True,
         use_mesh: bool = True,
-        top_k: int | None = None,  # kept for API compatibility but no longer limits results
     ) -> dict[str, Any]:
         """
         Perform hybrid search.
@@ -52,7 +49,6 @@ class HybridSearchEngine:
             use_semantic: Enable semantic search
             use_lexical: Enable lexical/keyword search
             use_mesh: Enable MeSH expansion
-            top_k: Number of results to return
 
         Returns:
             Dictionary with:
@@ -64,7 +60,6 @@ class HybridSearchEngine:
             >>> results = engine.search(
             ...     query="breast cancer RNA-seq",
             ...     filters={"organisms": ["Homo sapiens"], "tech_type": "rna-seq"},
-            ...     top_k=50,
             ... )
         """
         filters = filters or {}
@@ -79,44 +74,47 @@ class HybridSearchEngine:
         expanded_query = query
         matched_mesh_ids = []
 
+        mesh_concept_groups: list[set[str]] = []
         if use_mesh:
             expansion_result = self.query_expander.expand_query(query)
             expanded_query = expansion_result["expanded_query"]
             matched_mesh_ids = [term["mesh_id"] for term in expansion_result["matched_terms"]]
             logger.info(f"MeSH expansion: {len(matched_mesh_ids)} terms matched")
 
+            # Build concept groups: group MeSH IDs by the query token that produced them.
+            # Each distinct source token represents a separate concept in the query
+            # (e.g. "breast cancer" and "organ transplant" are two different concepts).
+            # Used by _mesh_only_search to require intersection across concepts.
+            token_to_ids: dict[str, set[str]] = {}
+            for term in expansion_result["matched_terms"]:
+                src = term.get("source_token", "")
+                token_to_ids.setdefault(src, set()).add(term["mesh_id"])
+            mesh_concept_groups = list(token_to_ids.values())
+
         # Step 2: Semantic search
+        # Pass original query and MeSH-expanded query separately so the search
+        # layer blends them as a weighted average vector (0.7 original + 0.3 expanded).
+        # This prevents long MeSH synonym lists from diluting the query intent.
         semantic_results = []
         if use_semantic:
             try:
-                semantic_results = semantic_search(
-                    query=expanded_query,
+                _exp = expanded_query if (use_mesh and expanded_query != query) else None
+                # Fetch once at the lowest acceptable threshold (0.45); results above
+                # higher thresholds naturally rank first because Milvus returns by score.
+                # This avoids up to 4 redundant round-trips to Milvus.
+                all_semantic = semantic_search(
+                    query=query,
+                    expanded_query=_exp,
                     top_k=settings.semantic_top_k,
-                    min_score=0.65,
+                    min_score=0.45,
                 )
-                # Progressively relax threshold to maximise recall.
-                # Common queries like "breast cancer" score mostly in the 0.45-0.55
-                # range against verbose clinical GEO text, so we always reach 0.45.
-                # Niche queries may still get few results even at 0.45 — that is
-                # expected; keyword and MeSH modes cover the remaining recall gap.
-                if len(semantic_results) < 50:
-                    semantic_results = semantic_search(
-                        query=expanded_query,
-                        top_k=settings.semantic_top_k,
-                        min_score=0.60,
-                    )
-                if len(semantic_results) < 50:
-                    semantic_results = semantic_search(
-                        query=expanded_query,
-                        top_k=settings.semantic_top_k,
-                        min_score=0.50,
-                    )
-                if len(semantic_results) < 50:
-                    semantic_results = semantic_search(
-                        query=expanded_query,
-                        top_k=settings.semantic_top_k,
-                        min_score=0.45,
-                    )
+                # Apply a tighter threshold when enough high-quality results exist,
+                # falling back to lower thresholds progressively.
+                for threshold in (0.65, 0.60, 0.50, 0.45):
+                    filtered = [r for r in all_semantic if r["score"] >= threshold]
+                    if len(filtered) >= 50 or threshold == 0.45:
+                        semantic_results = filtered
+                        break
                 logger.info(f"Semantic search: {len(semantic_results)} results")
             except Exception as e:
                 logger.error(f"Semantic search failed: {e}", exc_info=True)
@@ -131,10 +129,17 @@ class HybridSearchEngine:
             # thousands of loosely related datasets.
             all_mesh_terms = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
             mesh_preferred = all_mesh_terms[:5]
+            # Build mesh_id → preferred_name lookup for concept group AND logic
+            mesh_id_to_name = {
+                t["mesh_id"]: t["preferred_name"]
+                for t in (expansion_result["matched_terms"] if expansion_result else [])
+            }
             lexical_results = self._lexical_search(
                 query=query,
                 mesh_terms=mesh_preferred,
                 filters=filters,
+                mesh_concept_groups=mesh_concept_groups if use_mesh else None,
+                mesh_id_to_name=mesh_id_to_name if use_mesh else None,
             )
             logger.info(f"Lexical search: {len(lexical_results)} results")
 
@@ -142,9 +147,12 @@ class HybridSearchEngine:
         # MeSH IDs. This is the primary retrieval path when use_mesh=True and the
         # query term is a precise MeSH descriptor (e.g. "Vitiligo") that may not
         # appear verbatim in dataset text but IS stored in the gse_mesh table.
+        # For multi-concept queries, intersection logic is applied across concept groups.
         mesh_only_results = []
         if use_mesh and matched_mesh_ids:
-            mesh_only_results = self._mesh_only_search(matched_mesh_ids, filters)
+            mesh_only_results = self._mesh_only_search(
+                matched_mesh_ids, filters, mesh_concept_groups
+            )
             logger.info(f"MeSH-only search: {len(mesh_only_results)} results")
 
         # Step 5: Combine results using RRF
@@ -186,12 +194,19 @@ class HybridSearchEngine:
         query: str,
         filters: dict[str, Any],
         mesh_terms: list[str] | None = None,
-        top_k: int = 0,  # unused — kept for signature compat
+        mesh_concept_groups: list[set[str]] | None = None,
+        mesh_id_to_name: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Perform lexical search using PostgreSQL full-text search.
-        Original query and each MeSH term are OR'd so that expansion
-        terms don't require AND-matching across all words.
+
+        For single-concept queries: original OR logic — MeSH terms are OR'd in
+        as additional match pathways alongside the original query tokens.
+
+        For multi-concept queries: AND logic across concept groups — a dataset
+        must contain tokens from EACH concept group in its text. This aligns
+        with NCBI's behaviour where all query concepts must appear in the record.
+        MeSH preferred names are used as the representative token per group.
         """
         tsvec = func.setweight(
             func.to_tsvector("english", func.coalesce(GSESeries.title, "")), "A"
@@ -274,6 +289,33 @@ class HybridSearchEngine:
         ts_rank = func.ts_rank(tsvec, combined_tsquery)
         ts_match = tsvec.op("@@")(combined_tsquery)
 
+        # Multi-concept AND refinement: when multiple distinct concept groups are
+        # detected (e.g. "breast cancer" + "organ transplant"), require the dataset
+        # text to contain at least one token from EACH group. This mirrors NCBI's
+        # AND behaviour and prevents single-concept datasets from flooding results.
+        # Each group is represented by its MeSH preferred names OR'd within the group,
+        # then all groups are AND'd together as an additional filter condition.
+        if mesh_concept_groups and len(mesh_concept_groups) > 1 and mesh_id_to_name:
+            group_conditions = []
+            for group_ids in mesh_concept_groups:
+                group_names = [mesh_id_to_name[mid] for mid in group_ids if mid in mesh_id_to_name]
+                if not group_names:
+                    continue
+                # Build OR tsquery for all names in this concept group
+                group_tsquery = None
+                for name in group_names:
+                    name_cleaned = name.strip("\"'(),.")
+                    if len(name_cleaned) < 3:
+                        continue
+                    tq = func.plainto_tsquery("english", name_cleaned)
+                    group_tsquery = tq if group_tsquery is None else group_tsquery.op("||")(tq)
+                if group_tsquery is not None:
+                    group_conditions.append(tsvec.op("@@")(group_tsquery))
+
+            if len(group_conditions) > 1:
+                # AND across all concept groups — dataset must match all groups
+                ts_match = and_(ts_match, *group_conditions)
+
         filter_conditions = self._build_filter_conditions(filters)
         base_filter = and_(ts_match, *filter_conditions) if filter_conditions else ts_match
 
@@ -336,21 +378,72 @@ class HybridSearchEngine:
         self,
         matched_mesh_ids: list[str],
         filters: dict[str, Any],
+        mesh_concept_groups: list[set[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Retrieve datasets directly tagged with matched MeSH IDs.
-        This is the primary retrieval path when the query is a precise MeSH
-        descriptor (e.g. "Vitiligo") — the term may not appear in dataset text
-        but IS stored as a gse_mesh association.
+
+        When mesh_concept_groups is provided (multiple distinct concepts detected,
+        e.g. "breast cancer" + "organ transplant"), a dataset must match at least
+        one MeSH ID from EACH concept group — intersection logic. This prevents
+        broad single-concept retrieval (e.g. all 6,000+ Breast Neoplasm datasets)
+        when the query clearly targets a multi-concept intersection.
+
+        For single-concept queries the original union logic applies.
         """
+        # Single-concept query: union retrieval — return all datasets matching any MeSH ID.
+        if not mesh_concept_groups or len(mesh_concept_groups) <= 1:
+            rows = (
+                self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+                .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+                .group_by(GSEMesh.accession)
+                .order_by(func.count(GSEMesh.mesh_id).desc())
+                .all()
+            )
+            return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
+
+        # Multi-concept query: hard intersection — a dataset must have at least one
+        # MeSH tag from EVERY concept group. Start from the smallest group and
+        # intersect progressively to keep the candidate set tight.
+        groups_sorted = sorted(mesh_concept_groups, key=len)
+
+        candidate_rows = (
+            self.db.query(GSEMesh.accession)
+            .filter(GSEMesh.mesh_id.in_(groups_sorted[0]))
+            .distinct()
+            .all()
+        )
+        candidate_accessions = {row.accession for row in candidate_rows}
+
+        for group in groups_sorted[1:]:
+            if not candidate_accessions:
+                break
+            group_rows = (
+                self.db.query(GSEMesh.accession)
+                .filter(
+                    GSEMesh.accession.in_(candidate_accessions),
+                    GSEMesh.mesh_id.in_(group),
+                )
+                .distinct()
+                .all()
+            )
+            candidate_accessions = {row.accession for row in group_rows}
+
+        if not candidate_accessions:
+            return []
+
+        # Score by total matched MeSH IDs across all groups within the intersection set
         rows = (
             self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
-            .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+            .filter(
+                GSEMesh.accession.in_(candidate_accessions),
+                GSEMesh.mesh_id.in_(matched_mesh_ids),
+            )
             .group_by(GSEMesh.accession)
             .order_by(func.count(GSEMesh.mesh_id).desc())
             .all()
         )
-        return [{"accession": accession, "score": float(count)} for accession, count in rows]
+        return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
 
     def _reciprocal_rank_fusion(
         self,
@@ -380,22 +473,32 @@ class HybridSearchEngine:
 
         scores: dict[str, float] = {}
 
+        # Weighted RRF: semantic results are given 2× weight relative to lexical
+        # and MeSH-only legs. This prevents broad MeSH tag retrieval (which matches
+        # every dataset tagged with a disease regardless of query aspect, e.g.
+        # "treatment options" vs "genomics") from burying the more precise semantic
+        # signal. Datasets found by semantic search that are also in lexical/MeSH
+        # still accumulate extra score from those legs on top.
+        SEMANTIC_WEIGHT = 2.0
+        LEXICAL_WEIGHT = 1.0
+        MESH_WEIGHT = 1.0
+
         # Add semantic results
         for rank, result in enumerate(semantic_results, start=1):
             accession = result["accession"]
-            rrf_score = 1.0 / (k + rank)
+            rrf_score = SEMANTIC_WEIGHT / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
 
         # Add lexical results
         for rank, result in enumerate(lexical_results, start=1):
             accession = result["accession"]
-            rrf_score = 1.0 / (k + rank)
+            rrf_score = LEXICAL_WEIGHT / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
 
         # Add MeSH-only results (direct tag lookup)
         for rank, result in enumerate(mesh_only_results or [], start=1):
             accession = result["accession"]
-            rrf_score = 1.0 / (k + rank)
+            rrf_score = MESH_WEIGHT / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
 
         # Boost scores for datasets with matching MeSH terms
@@ -457,7 +560,6 @@ class HybridSearchEngine:
             ranked_accessions: List of accessions in rank order
             filters: Structured filters
             matched_mesh_ids: MeSH IDs for highlighting
-            top_k: Number of results to return
 
         Returns:
             List of result dictionaries with full metadata
@@ -560,7 +662,6 @@ class HybridSearchEngine:
 def search_geo(
     query: str,
     filters: dict[str, Any] | None = None,
-    top_k: int = 50,
     db: Session | None = None,
 ) -> dict[str, Any]:
     """
@@ -569,65 +670,20 @@ def search_geo(
     Args:
         query: Search query
         filters: Optional filters
-        top_k: Number of results
         db: Optional database session
 
     Returns:
         Search results dictionary
     """
     if db is None:
-        db_gen = get_db()
-        db = next(db_gen)
+        db = SessionLocal()
         close_db = True
     else:
         close_db = False
 
     try:
         engine = HybridSearchEngine(db)
-        return engine.search(query=query, filters=filters, top_k=top_k)
+        return engine.search(query=query, filters=filters)
     finally:
         if close_db:
             db.close()
-
-
-def make_snippet(text: str, query_terms: list[str], max_length: int = 200) -> str:
-    """
-    Create a highlighted snippet from text.
-
-    Args:
-        text: Full text
-        query_terms: Terms to highlight
-        max_length: Maximum snippet length
-
-    Returns:
-        Snippet with context around matches
-    """
-    if not text or not query_terms:
-        return text[:max_length] + "..." if len(text) > max_length else text
-
-    text_lower = text.lower()
-
-    # Find first match
-    first_match_pos = len(text)
-    for term in query_terms:
-        pos = text_lower.find(term.lower())
-        if pos != -1 and pos < first_match_pos:
-            first_match_pos = pos
-
-    if first_match_pos == len(text):
-        # No matches, return beginning
-        return text[:max_length] + "..." if len(text) > max_length else text
-
-    # Extract context around match
-    start = max(0, first_match_pos - 50)
-    end = min(len(text), first_match_pos + max_length)
-
-    snippet = text[start:end]
-
-    # Add ellipsis
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(text):
-        snippet = snippet + "..."
-
-    return snippet

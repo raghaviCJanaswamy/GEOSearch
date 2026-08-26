@@ -78,10 +78,12 @@ class LocalEmbeddingProvider(EmbeddingProvider):
 
         logger.debug(f"Embedding {len(texts)} texts with local model")
 
-        # Encode texts
+        # Encode texts — normalize_embeddings=True ensures unit-length vectors,
+        # which is required for Inner Product (IP) to equal cosine similarity in Milvus.
         embeddings = self.model.encode(
             texts,
             convert_to_numpy=True,
+            normalize_embeddings=True,
             show_progress_bar=False,
             batch_size=32,
         )
