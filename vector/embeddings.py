@@ -168,6 +168,74 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
         return self._dimension
 
 
+class AzureOpenAIEmbeddingProvider(EmbeddingProvider):
+    """
+    Azure OpenAI embedding provider.
+    Requires AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, and
+    AZURE_OPENAI_DEPLOYMENT to be set.
+    """
+
+    DIMENSION_MAP = {
+        "text-embedding-3-small": 1536,
+        "text-embedding-3-large": 3072,
+        "text-embedding-ada-002": 1536,
+    }
+
+    def __init__(self):
+        self.api_key = settings.azure_openai_api_key
+        self.endpoint = settings.azure_openai_endpoint
+        self.api_version = settings.azure_openai_api_version
+        self.deployment = settings.azure_openai_deployment
+
+        if not self.api_key:
+            raise ValueError("AZURE_OPENAI_API_KEY is not set.")
+        if not self.endpoint:
+            raise ValueError("AZURE_OPENAI_ENDPOINT is not set.")
+        if not self.deployment:
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT is not set.")
+
+        logger.info(
+            f"Initializing Azure OpenAI provider: deployment={self.deployment}, "
+            f"endpoint={self.endpoint}, api_version={self.api_version}"
+        )
+
+        try:
+            from openai import AzureOpenAI
+        except ImportError:
+            raise ImportError(
+                "openai package not installed. Install with: pip install openai"
+            )
+
+        self.client = AzureOpenAI(
+            api_key=self.api_key,
+            azure_endpoint=self.endpoint,
+            api_version=self.api_version,
+        )
+        self._dimension = self.DIMENSION_MAP.get(self.deployment, settings.embedding_dimension)
+        logger.info(f"Azure OpenAI provider ready (dimension: {self._dimension})")
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """Generate embeddings using Azure OpenAI API."""
+        if not texts:
+            return []
+
+        logger.debug(f"Embedding {len(texts)} texts with Azure OpenAI")
+
+        try:
+            response = self.client.embeddings.create(
+                model=self.deployment,
+                input=texts,
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            logger.error(f"Azure OpenAI embedding failed: {e}")
+            raise
+
+    def get_dimension(self) -> int:
+        """Get embedding dimension."""
+        return self._dimension
+
+
 def get_embedding_provider() -> EmbeddingProvider:
     """
     Factory function to get the configured embedding provider.
@@ -184,8 +252,10 @@ def get_embedding_provider() -> EmbeddingProvider:
         return LocalEmbeddingProvider()
     elif provider_type == "openai":
         return OpenAIEmbeddingProvider()
+    elif provider_type == "azure_openai":
+        return AzureOpenAIEmbeddingProvider()
     else:
         raise ValueError(
             f"Unknown embedding provider: {provider_type}. "
-            f"Must be 'local' or 'openai'"
+            f"Must be 'local', 'openai', or 'azure_openai'"
         )

@@ -4,6 +4,7 @@ Interactive search interface for GEO datasets.
 """
 import csv
 import io
+import json
 import logging
 import os
 import subprocess
@@ -1359,7 +1360,7 @@ def main() -> None:
             end = min(start + PAGE_SIZE, total)
 
             # NCBI-style header + download buttons on the same row
-            hdr_col, dl_col1, dl_col2 = st.columns([6, 1.2, 1.2])
+            hdr_col, dl_col1, dl_col2, dl_col3, dl_col4 = st.columns([4, 1.2, 1.2, 1.2, 1.2])
             with hdr_col:
                 st.markdown(
                     f'<div style="font-size:0.9em;color:#444;margin-bottom:6px;">'
@@ -1399,6 +1400,55 @@ def main() -> None:
                     mime="text/csv",
                     use_container_width=True,
                     key="dl_csv",
+                )
+            with dl_col3:
+                json_results = [
+                    {
+                        "query": saved_query,
+                        "total_results": total,
+                        "expanded_query": metadata.get("expanded_query", ""),
+                        "mesh_terms": [t["preferred_name"] for t in metadata.get("mesh_terms", [])],
+                        "results": [
+                            {
+                                "rank": rank,
+                                "accession": r.get("accession", ""),
+                                "title": r.get("title", ""),
+                                "organisms": r.get("organisms") or [],
+                                "tech_type": r.get("tech_type", ""),
+                                "sample_count": r.get("sample_count"),
+                                "submission_date": (r.get("submission_date") or "")[:10],
+                                "summary": r.get("summary", ""),
+                                "geo_url": r.get("geo_url", ""),
+                                "matched_mesh_terms": [t["preferred_name"] for t in (r.get("matched_mesh_terms") or [])],
+                            }
+                            for rank, r in enumerate(result_list, start=1)
+                        ],
+                    }
+                ]
+                st.download_button(
+                    label="⬇ Full CSV (.json)",
+                    data=json.dumps(json_results, indent=2),
+                    file_name=f"geosearch_{saved_query.replace(' ', '_')[:30]}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="dl_json",
+                )
+            with dl_col4:
+                search_json = {
+                    "query": saved_query,
+                    "expanded_query": metadata.get("expanded_query", ""),
+                    "mesh_terms": [t["preferred_name"] for t in metadata.get("mesh_terms", [])],
+                    "filters": metadata.get("filters_applied", {}),
+                    "total_results": total,
+                    "accessions": [r["accession"] for r in result_list],
+                }
+                st.download_button(
+                    label="⬇ Search (.json)",
+                    data=json.dumps(search_json, indent=2),
+                    file_name=f"geosearch_query_{saved_query.replace(' ', '_')[:30]}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                    key="dl_search_json",
                 )
 
             # Top pagination controls

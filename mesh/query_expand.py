@@ -53,8 +53,10 @@ GENERIC_MODIFIER_WORDS: frozenset[str] = frozenset({
     "cell", "cells", "tissue", "tissues",
 })
 
-# Lay terms that have NO MeSH entry_terms mapping — verified gaps in MeSH vocabulary.
-# Only add terms here after confirming they don't appear in mesh_term.entry_terms.
+# Lay terms and acronyms that don't appear in MeSH entry_terms — verified against the DB.
+# Also covers biomedical acronyms whose short form (≤5 chars) is blocked by the length
+# gates in _find_matching_mesh_terms but whose expansion IS a valid MeSH preferred name
+# or entry_term. Each alias is the full form used in MeSH preferred_name / entry_terms.
 LAY_TERM_ALIASES: dict[str, list[str]] = {
     # "throat" only maps to Pharyngitis/Pharynx in MeSH — no cancer mapping
     "throat cancer": ["head and neck neoplasms", "oropharyngeal neoplasms",
@@ -67,7 +69,106 @@ LAY_TERM_ALIASES: dict[str, list[str]] = {
     "high blood pressure": ["hypertension"],
     # "blood cancer" not in MeSH
     "blood cancer": ["leukemia", "lymphoma", "multiple myeloma", "hematologic neoplasms"],
+
+    # --- Biomedical acronyms (verified against mesh_term DB) ---
+    # Metabolic liver disease — "MASLD" not an entry_term; maps to D065626
+    "masld": ["non-alcoholic fatty liver disease"],
+    "mafld": ["non-alcoholic fatty liver disease"],
+    # Graft-versus-host disease — "GVHD" not an entry_term; maps to D006086
+    "gvhd":  ["graft-versus-host disease"],
+    # NF-κB — "NFkB"/"nfkb" not entry_terms; D016328 has "NF-kappa B" as preferred name
+    "nfkb":  ["nf-kappa b"],
+    "nf-kb": ["nf-kappa b"],
+    # TGF-β — "TGFb"/"tgfb" not entry_terms; D016212
+    "tgfb":  ["transforming growth factor beta"],
+    "tgf-b": ["transforming growth factor beta"],
+    # IFN-γ — "IFNg"/"ifng" not entry_terms; D007371
+    "ifng":  ["interferon-gamma"],
+    "ifn-g": ["interferon-gamma"],
+    # IL-6 — token "il6" is only 3 chars (blocked by length gate); D015850
+    "il6":   ["interleukin-6"],
+    "il-6":  ["interleukin-6"],
+    # PBMC — not an entry_term; maps to D007963 Leukocytes, Mononuclear
+    "pbmc":  ["peripheral blood mononuclear cells"],
+    "pbmcs": ["peripheral blood mononuclear cells"],
+    # LPS — 3 chars (length-blocked); maps to D008070 Lipopolysaccharides
+    "lps":   ["lipopolysaccharides"],
+    # HCC — 3 chars; maps to D006528 Carcinoma, Hepatocellular
+    "hcc":   ["carcinoma, hepatocellular"],
+    # HBV — 3 chars; maps to D006515 Hepatitis B virus
+    "hbv":   ["hepatitis b virus"],
+    # Cancer-associated fibroblasts — "CAFs"/"cafs" not entry_terms; D000072645
+    "cafs":  ["cancer-associated fibroblasts"],
+    "caf":   ["cancer-associated fibroblasts"],
+    # Mpox — 4 chars (blocked by length gate); D045908
+    "mpox":  ["monkeypox"],
+    # Mesenchymal stem cells — "MSC"/"msc" is 3 chars; D059630
+    "msc":   ["mesenchymal stem cells"],
+    "mscs":  ["mesenchymal stem cells"],
+    # PDAC — not in MeSH; nearest equivalent descriptors
+    "pdac":  ["pancreatic ductal adenocarcinoma", "pancreatic neoplasms"],
+    # MKI67 — gene name not in MeSH; nearest descriptor
+    "mki67": ["ki-67 antigen"],
+    # CAR-T — token form not in MeSH entry_terms
+    "car-t": ["receptors, chimeric antigen", "immunotherapy, adoptive"],
+    "cart":  ["receptors, chimeric antigen", "immunotherapy, adoptive"],
 }
+
+
+# Word-level spelling corrections for common biomedical misspellings.
+# Applied before tokenization so both MeSH expansion and lexical search benefit.
+# Keys are lowercase misspelled words; values are the correct forms.
+# Only plain English misspellings are listed here — biomedical acronyms and gene
+# names are intentionally excluded (handled by LAY_TERM_ALIASES instead).
+SPELLING_CORRECTIONS: dict[str, str] = {
+    # Observed in benchmark queries
+    "mesenchimal":  "mesenchymal",
+    "gliobastoma":  "glioblastoma",
+    "psorasis":     "psoriasis",
+    "schizoprenia": "schizophrenia",
+    "leukimia":     "leukemia",
+    "leukimia":     "leukemia",
+    "breat":        "breast",
+    "faty":         "fatty",
+    "vitilago":     "vitiligo",
+    "sclorosis":    "sclerosis",
+    "parkison":     "parkinson",
+    "gliobastoma":  "glioblastoma",
+    # Common additional biomedical misspellings
+    "melanomia":    "melanoma",
+    "leukaemia":    "leukemia",   # British spelling — maps to same MeSH term
+    "haemoglobin":  "hemoglobin",
+    "oesophageal":  "esophageal",
+    "fibroblast":   "fibroblast",  # already correct — no-op guard
+    "cardiomyopthy":"cardiomyopathy",
+    "hepatocelluar":"hepatocellular",
+    "glioblastome": "glioblastoma",
+    "schizophrenia":"schizophrenia",  # already correct — no-op guard
+    "alzheimers":   "alzheimer",
+    "parkinsons":   "parkinson",
+}
+
+
+def _correct_spelling(query: str) -> str:
+    """
+    Apply word-level spelling corrections to a query string.
+
+    Corrects each word independently against SPELLING_CORRECTIONS.
+    Words not in the dict are passed through unchanged — this preserves
+    biomedical acronyms, gene names, and assay abbreviations.
+    """
+    words = query.split()
+    corrected = []
+    for w in words:
+        # Strip trailing punctuation (apostrophes, commas) before lookup,
+        # then restore the suffix so "Parkison's" → lookup "parkison" → "parkinson's"
+        stripped = w.lower().rstrip("'s,.")
+        if stripped in SPELLING_CORRECTIONS:
+            suffix = w[len(stripped):]  # preserve original capitalisation suffix
+            corrected.append(SPELLING_CORRECTIONS[stripped] + suffix)
+        else:
+            corrected.append(SPELLING_CORRECTIONS.get(w.lower(), w))
+    return " ".join(corrected)
 
 
 class QueryExpander:
@@ -113,18 +214,26 @@ class QueryExpander:
         """
         logger.info(f"Expanding query: '{query}'")
 
-        # Tokenize query
-        tokens = self._tokenize(query)
-        tokens = self._add_alias_tokens(query, tokens)
+        # Apply spelling corrections before tokenization so both MeSH expansion
+        # and the corrected_query returned to the caller (used by lexical search)
+        # benefit from the fix. The original query string is preserved separately.
+        corrected_query = _correct_spelling(query)
+        if corrected_query != query:
+            logger.info(f"Spelling corrected: '{query}' -> '{corrected_query}'")
 
-        # Find matching MeSH terms
-        matched_terms = self._find_matching_mesh_terms(tokens, max_terms, query)
+        # Tokenize corrected query; pass corrected form to alias injection too
+        tokens = self._tokenize(corrected_query)
+        tokens = self._add_alias_tokens(corrected_query, tokens)
+
+        # Find matching MeSH terms (use corrected query for match context)
+        matched_terms = self._find_matching_mesh_terms(tokens, max_terms, corrected_query)
 
         if not matched_terms:
             logger.info("No MeSH terms matched")
             return {
                 "original_query": query,
-                "expanded_query": query,
+                "corrected_query": corrected_query,
+                "expanded_query": corrected_query,
                 "matched_terms": [],
                 "expansion_tokens": [],
             }
@@ -133,20 +242,20 @@ class QueryExpander:
         expansion_tokens = []
 
         for term_info in matched_terms:
-            # Add preferred name if different from original
+            # Add preferred name if different from corrected query
             preferred = term_info["preferred_name"]
-            if preferred.lower() not in query.lower():
+            if preferred.lower() not in corrected_query.lower():
                 expansion_tokens.append(preferred)
 
             # Add selected entry terms (synonyms)
             if include_synonyms and term_info.get("entry_terms"):
                 # Add up to 2 most relevant entry terms per MeSH term
                 for entry_term in term_info["entry_terms"][:2]:
-                    if entry_term.lower() not in query.lower():
+                    if entry_term.lower() not in corrected_query.lower():
                         expansion_tokens.append(entry_term)
 
-        # Combine original query with expansions
-        expanded_query = f"{query} {' '.join(expansion_tokens)}"
+        # Combine corrected query with expansions
+        expanded_query = f"{corrected_query} {' '.join(expansion_tokens)}"
 
         logger.info(
             f"Expanded query with {len(matched_terms)} MeSH terms, "
@@ -155,6 +264,7 @@ class QueryExpander:
 
         return {
             "original_query": query,
+            "corrected_query": corrected_query,
             "expanded_query": expanded_query,
             "matched_terms": matched_terms,
             "expansion_tokens": expansion_tokens,

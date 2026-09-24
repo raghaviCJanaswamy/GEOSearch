@@ -38,13 +38,19 @@ class Settings(BaseSettings):
     rate_limit_qps: float = 3.0  # Queries per second
 
     # Embeddings
-    embedding_provider: Literal["local", "openai"] = "local"
+    embedding_provider: Literal["local", "openai", "azure_openai"] = "local"
     embedding_model: str = "NeuML/pubmedbert-base-embeddings"
     embedding_dimension: int = 768
 
     # OpenAI
     openai_api_key: str | None = None
     openai_embedding_model: str = "text-embedding-3-small"
+
+    # Azure OpenAI
+    azure_openai_api_key: str | None = None
+    azure_openai_endpoint: str | None = None
+    azure_openai_api_version: str = "2024-02-01"
+    azure_openai_deployment: str | None = None
 
     # LLM Q&A
     llm_provider: str = "auto"           # "auto" | "ollama" | "openai" | "none"
@@ -53,13 +59,13 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3"         # model tag pulled in Ollama
 
     # Search
-    semantic_top_k: int = 500   # Milvus candidates — raised from 100 so more datasets
-                                 # are scored before the min_score filter is applied.
-                                 # Critical for common queries like "breast cancer" where
-                                 # thousands of relevant datasets exist but cosine similarity
-                                 # scores are spread across a wide range.
+    semantic_top_k: int = 1000  # Milvus candidates — raised to 1000 so high-volume queries
+                                 # (e.g. NFkB activation, triple-negative breast cancer) surface
+                                 # relevant datasets beyond the former 500-candidate ceiling.
+                                 # The adaptive threshold cascade (0.65→0.45) still controls
+                                 # which candidates enter RRF, so ranking quality is preserved.
     lexical_top_k: int = 100
-    final_top_k: int = 50
+    final_top_k: int = 500
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
 
     # MeSH tagging

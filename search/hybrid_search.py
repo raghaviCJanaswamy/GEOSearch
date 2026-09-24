@@ -39,6 +39,7 @@ class HybridSearchEngine:
         use_semantic: bool = True,
         use_lexical: bool = True,
         use_mesh: bool = True,
+        top_k: int | None = None,
     ) -> dict[str, Any]:
         """
         Perform hybrid search.
@@ -69,15 +70,17 @@ class HybridSearchEngine:
             f"semantic={use_semantic}, lexical={use_lexical}, mesh={use_mesh}"
         )
 
-        # Step 1: MeSH expansion
+        # Step 1: MeSH expansion (includes spelling correction pre-pass)
         expansion_result = None
         expanded_query = query
+        corrected_query = query  # may differ from query if spelling was corrected
         matched_mesh_ids = []
 
         mesh_concept_groups: list[set[str]] = []
         if use_mesh:
-            expansion_result = self.query_expander.expand_query(query)
+            expansion_result = self.query_expander.expand_query(query, max_terms=8)
             expanded_query = expansion_result["expanded_query"]
+            corrected_query = expansion_result.get("corrected_query", query)
             matched_mesh_ids = [term["mesh_id"] for term in expansion_result["matched_terms"]]
             logger.info(f"MeSH expansion: {len(matched_mesh_ids)} terms matched")
 
@@ -98,12 +101,12 @@ class HybridSearchEngine:
         semantic_results = []
         if use_semantic:
             try:
-                _exp = expanded_query if (use_mesh and expanded_query != query) else None
+                _exp = expanded_query if (use_mesh and expanded_query != corrected_query) else None
                 # Fetch once at the lowest acceptable threshold (0.45); results above
                 # higher thresholds naturally rank first because Milvus returns by score.
                 # This avoids up to 4 redundant round-trips to Milvus.
                 all_semantic = semantic_search(
-                    query=query,
+                    query=corrected_query,
                     expanded_query=_exp,
                     top_k=settings.semantic_top_k,
                     min_score=0.45,
@@ -124,18 +127,22 @@ class HybridSearchEngine:
         # so each is OR'd, not AND'd together
         lexical_results = []
         if use_lexical:
-            # Cap MeSH expansion to top 5 most specific terms to prevent over-retrieval.
-            # Too many OR'd MeSH synonyms cause broad queries like "lung cancer" to match
-            # thousands of loosely related datasets.
+            # Cap MeSH expansion to prevent over-retrieval in lexical OR chain.
+            # Single-concept queries: cap at 5 — broad terms like "lung cancer" already
+            # match thousands of datasets; more synonyms inflate noise further.
+            # Multi-concept queries: allow up to 8 — each concept group maps to 2–4 MeSH
+            # descriptors (e.g. IDH1 glioma subtypes, HBV + hepatocellular carcinoma),
+            # so a tighter cap would miss valid disease-subtype terms.
             all_mesh_terms = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
-            mesh_preferred = all_mesh_terms[:5]
+            mesh_cap = 8 if len(mesh_concept_groups) > 1 else 5
+            mesh_preferred = all_mesh_terms[:mesh_cap]
             # Build mesh_id → preferred_name lookup for concept group AND logic
             mesh_id_to_name = {
                 t["mesh_id"]: t["preferred_name"]
                 for t in (expansion_result["matched_terms"] if expansion_result else [])
             }
             lexical_results = self._lexical_search(
-                query=query,
+                query=corrected_query,
                 mesh_terms=mesh_preferred,
                 filters=filters,
                 mesh_concept_groups=mesh_concept_groups if use_mesh else None,
@@ -163,9 +170,10 @@ class HybridSearchEngine:
             matched_mesh_ids=matched_mesh_ids,
         )
 
-        # Step 6: Apply filters and fetch full metadata — no cap, return all matches
+        # Step 6: Apply filters and fetch full metadata
+        ranked = combined_results[:top_k if top_k is not None else settings.final_top_k]
         final_results = self._fetch_and_filter_results(
-            ranked_accessions=combined_results,
+            ranked_accessions=ranked,
             filters=filters,
             matched_mesh_ids=matched_mesh_ids,
         )
@@ -383,13 +391,14 @@ class HybridSearchEngine:
         """
         Retrieve datasets directly tagged with matched MeSH IDs.
 
-        When mesh_concept_groups is provided (multiple distinct concepts detected,
-        e.g. "breast cancer" + "organ transplant"), a dataset must match at least
-        one MeSH ID from EACH concept group — intersection logic. This prevents
-        broad single-concept retrieval (e.g. all 6,000+ Breast Neoplasm datasets)
-        when the query clearly targets a multi-concept intersection.
+        When mesh_concept_groups is provided, intersection logic is applied across
+        concept groups that have meaningful dataset coverage (> 10 tagged datasets).
+        Groups with ≤ 10 datasets are skipped — they represent either zero-coverage
+        MeSH terms or bad expansions from stopword bigrams (e.g. "tumor and" → wrong
+        MeSH match) that would collapse the intersection to zero.
 
-        For single-concept queries the original union logic applies.
+        If fewer than 2 groups survive the coverage filter, falls back to union retrieval.
+        For single-concept queries the union logic always applies.
         """
         # Single-concept query: union retrieval — return all datasets matching any MeSH ID.
         if not mesh_concept_groups or len(mesh_concept_groups) <= 1:
@@ -402,10 +411,44 @@ class HybridSearchEngine:
             )
             return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
 
-        # Multi-concept query: hard intersection — a dataset must have at least one
-        # MeSH tag from EVERY concept group. Start from the smallest group and
-        # intersect progressively to keep the candidate set tight.
-        groups_sorted = sorted(mesh_concept_groups, key=len)
+        # Multi-concept query: intersection across concept groups, but only for groups
+        # with meaningful dataset coverage (> MIN_GROUP_COVERAGE).
+        #
+        # Groups with ≤ MIN_GROUP_COVERAGE datasets are skipped before intersecting.
+        # This handles two failure modes:
+        #   1. Zero-coverage groups: a MeSH term exists but no datasets are tagged with it
+        #      (e.g. "DNA Methylation" D019175 has 0 tagged datasets in our DB).
+        #   2. Bad expansions from stopword bigrams: tokens like "tumor and", "normal in",
+        #      "ar signaling" partially match unrelated MeSH terms with 0–5 dataset tags.
+        #      These spurious groups would collapse the intersection to zero or near-zero,
+        #      discarding all valid results from the well-matched groups.
+        # If fewer than 2 groups survive the coverage filter, fall back to union retrieval.
+        MIN_GROUP_COVERAGE = 10
+
+        # Count tagged datasets per group and filter out low-coverage groups
+        qualified_groups: list[set[str]] = []
+        for group in mesh_concept_groups:
+            cnt = (
+                self.db.query(func.count(GSEMesh.accession.distinct()))
+                .filter(GSEMesh.mesh_id.in_(group))
+                .scalar()
+            ) or 0
+            if cnt > MIN_GROUP_COVERAGE:
+                qualified_groups.append(group)
+
+        # Fewer than 2 qualified groups → AND would be meaningless; fall back to union
+        if len(qualified_groups) <= 1:
+            rows = (
+                self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+                .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+                .group_by(GSEMesh.accession)
+                .order_by(func.count(GSEMesh.mesh_id).desc())
+                .all()
+            )
+            return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
+
+        # Intersect progressively across qualified groups (smallest first)
+        groups_sorted = sorted(qualified_groups, key=len)
 
         candidate_rows = (
             self.db.query(GSEMesh.accession)
