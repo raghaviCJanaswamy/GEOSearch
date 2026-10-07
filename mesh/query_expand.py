@@ -112,6 +112,18 @@ LAY_TERM_ALIASES: dict[str, list[str]] = {
     # CAR-T — token form not in MeSH entry_terms
     "car-t": ["receptors, chimeric antigen", "immunotherapy, adoptive"],
     "cart":  ["receptors, chimeric antigen", "immunotherapy, adoptive"],
+    # AR signaling — "AR" is 2 chars (blocked by length gate); maps to D011944
+    "ar signaling": ["receptors, androgen", "androgen receptor"],
+    "ar":    ["receptors, androgen"],
+    # HBV-related HCC — compound alias
+    "hbv-related hcc": ["hepatitis b virus", "carcinoma, hepatocellular"],
+    "hbv related hcc": ["hepatitis b virus", "carcinoma, hepatocellular"],
+    # Mycobacterium tuberculosis — ensure macrophage link
+    "tuberculosis infected macrophages": ["tuberculosis", "macrophages"],
+    "mtb":   ["mycobacterium tuberculosis", "tuberculosis"],
+    # REST knockdown — REST is a transcription factor, not a MeSH term
+    "rest knockdown": ["repressor proteins", "gene silencing"],
+    "rest":  ["repressor proteins"],
 }
 
 
@@ -305,11 +317,15 @@ class QueryExpander:
 
     def _add_alias_tokens(self, query: str, tokens: list[str]) -> list[str]:
         """Add alias tokens for common lay phrases to improve matching."""
+        import re as _re
         combined = list(tokens)
         q = query.lower()
 
         for phrase, aliases in LAY_TERM_ALIASES.items():
-            if phrase in q:
+            # Use word-boundary matching to prevent "ar" from matching inside
+            # "cardiac", "ovarian", "Stargardt", etc.
+            pattern = r"(?<![a-z0-9])" + _re.escape(phrase) + r"(?![a-z0-9])"
+            if _re.search(pattern, q):
                 for alias in aliases:
                     if alias not in combined:
                         combined.append(alias)

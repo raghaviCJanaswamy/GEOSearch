@@ -532,6 +532,36 @@ def render_result_card(result: dict[str, Any]) -> None:
         ])
         pubmed_html = f'<span style="font-size:0.82em;color:#666;">📄 {links}</span>'
 
+    # Judge tier badge + reason
+    tier = result.get("tier", "")
+    reason = result.get("reason", "")
+    tier_html = ""
+    if tier == "relevant":
+        tier_html = (
+            '<span style="background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7;'
+            'border-radius:10px;padding:2px 10px;font-size:0.78em;font-weight:600;'
+            'margin-left:8px;vertical-align:middle;">✓ Best Match</span>'
+        )
+    elif tier == "borderline":
+        tier_html = (
+            '<span style="background:#fff8e1;color:#f57f17;border:1px solid #ffe082;'
+            'border-radius:10px;padding:2px 10px;font-size:0.78em;font-weight:600;'
+            'margin-left:8px;vertical-align:middle;">~ Possible Match</span>'
+        )
+    elif tier == "not_relevant":
+        tier_html = (
+            '<span style="background:#fce4ec;color:#c62828;border:1px solid #ef9a9a;'
+            'border-radius:10px;padding:2px 10px;font-size:0.78em;font-weight:600;'
+            'margin-left:8px;vertical-align:middle;">✗ Low Relevance</span>'
+        )
+
+    reason_html = ""
+    if reason and tier:
+        reason_html = (
+            f'<div style="font-size:0.78em;color:#777;font-style:italic;margin-top:2px;">'
+            f'{reason}</div>'
+        )
+
     card_html = f"""
 <div style="padding:10px 0 6px 0;border-bottom:1px solid #eee;">
   <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:4px;">
@@ -540,10 +570,12 @@ def render_result_card(result: dict[str, Any]) -> None:
          style="font-weight:700;font-size:1.05em;color:#1976d2;text-decoration:none;">
         {accession}
       </a>
+      {tier_html}
       <span style="font-weight:600;font-size:0.95em;margin-left:10px;">{title}</span>
     </span>
   </div>
   <div style="font-size:0.82em;color:#555;margin:3px 0 4px 0;">{meta_html}</div>
+  {reason_html}
   {pubmed_html}
 </div>
 """
@@ -1306,23 +1338,6 @@ def main() -> None:
     elif search_clicked:
         st.warning("Please enter a search query or choose at least one filter.")
 
-    # Show annotation export status + download button if available
-    if st.session_state.get("_export_path") and st.session_state.get("_export_content"):
-        _exp_path = st.session_state["_export_path"]
-        _exp_content = st.session_state["_export_content"]
-        _exp_fname = Path(_exp_path).name
-        col_info, col_dl = st.columns([5, 2])
-        with col_info:
-            st.success(f"Annotations export saved to `output/{_exp_fname}`")
-        with col_dl:
-            st.download_button(
-                label="⬇ Descriptions (.md)",
-                data=_exp_content,
-                file_name=_exp_fname,
-                mime="text/markdown",
-                use_container_width=True,
-                key="dl_descriptions",
-            )
 
     # Render stored results (persists across pagination reruns)
     if st.session_state.get("_results"):
@@ -1347,6 +1362,23 @@ def main() -> None:
                 ])
                 st.markdown(mesh_html, unsafe_allow_html=True)
 
+        # Judge summary banner
+        if metadata.get("judge_used"):
+            rel  = metadata.get("relevant_count", 0)
+            bord = metadata.get("borderline_count", 0)
+            nrel = metadata.get("not_relevant_count", 0)
+            judged = rel + bord + nrel
+            st.markdown(
+                f'<div style="background:#f3f8ff;border:1px solid #c5d8f5;border-radius:8px;'
+                f'padding:8px 14px;margin-bottom:10px;font-size:0.85em;color:#333;">'
+                f'<b>AI Relevance Judge</b> reviewed the top {judged} results &nbsp;·&nbsp; '
+                f'<span style="color:#2e7d32;font-weight:600;">✓ {rel} Best Match</span>'
+                f'&nbsp;&nbsp;<span style="color:#f57f17;font-weight:600;">~ {bord} Possible</span>'
+                f'&nbsp;&nbsp;<span style="color:#c62828;font-weight:600;">✗ {nrel} Low Relevance</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
         if result_list:
             PAGE_SIZE = 20
             total = len(result_list)
@@ -1360,7 +1392,7 @@ def main() -> None:
             end = min(start + PAGE_SIZE, total)
 
             # NCBI-style header + download buttons on the same row
-            hdr_col, dl_col1, dl_col2, dl_col3, dl_col4 = st.columns([4, 1.2, 1.2, 1.2, 1.2])
+            hdr_col, dl_col2 = st.columns([5, 1.2])
             with hdr_col:
                 st.markdown(
                     f'<div style="font-size:0.9em;color:#444;margin-bottom:6px;">'
@@ -1368,16 +1400,6 @@ def main() -> None:
                     f'&nbsp;&nbsp;|&nbsp;&nbsp;Page {page} of {total_pages}'
                     f'</div>',
                     unsafe_allow_html=True,
-                )
-            with dl_col1:
-                gse_list = "\n".join(r["accession"] for r in result_list)
-                st.download_button(
-                    label="⬇ GSE IDs (.txt)",
-                    data=gse_list,
-                    file_name=f"geosearch_{saved_query.replace(' ', '_')[:30]}.txt",
-                    mime="text/plain",
-                    use_container_width=True,
-                    key="dl_txt",
                 )
             with dl_col2:
                 csv_buf = io.StringIO()
@@ -1400,55 +1422,6 @@ def main() -> None:
                     mime="text/csv",
                     use_container_width=True,
                     key="dl_csv",
-                )
-            with dl_col3:
-                json_results = [
-                    {
-                        "query": saved_query,
-                        "total_results": total,
-                        "expanded_query": metadata.get("expanded_query", ""),
-                        "mesh_terms": [t["preferred_name"] for t in metadata.get("mesh_terms", [])],
-                        "results": [
-                            {
-                                "rank": rank,
-                                "accession": r.get("accession", ""),
-                                "title": r.get("title", ""),
-                                "organisms": r.get("organisms") or [],
-                                "tech_type": r.get("tech_type", ""),
-                                "sample_count": r.get("sample_count"),
-                                "submission_date": (r.get("submission_date") or "")[:10],
-                                "summary": r.get("summary", ""),
-                                "geo_url": r.get("geo_url", ""),
-                                "matched_mesh_terms": [t["preferred_name"] for t in (r.get("matched_mesh_terms") or [])],
-                            }
-                            for rank, r in enumerate(result_list, start=1)
-                        ],
-                    }
-                ]
-                st.download_button(
-                    label="⬇ Full CSV (.json)",
-                    data=json.dumps(json_results, indent=2),
-                    file_name=f"geosearch_{saved_query.replace(' ', '_')[:30]}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    key="dl_json",
-                )
-            with dl_col4:
-                search_json = {
-                    "query": saved_query,
-                    "expanded_query": metadata.get("expanded_query", ""),
-                    "mesh_terms": [t["preferred_name"] for t in metadata.get("mesh_terms", [])],
-                    "filters": metadata.get("filters_applied", {}),
-                    "total_results": total,
-                    "accessions": [r["accession"] for r in result_list],
-                }
-                st.download_button(
-                    label="⬇ Search (.json)",
-                    data=json.dumps(search_json, indent=2),
-                    file_name=f"geosearch_query_{saved_query.replace(' ', '_')[:30]}.json",
-                    mime="application/json",
-                    use_container_width=True,
-                    key="dl_search_json",
                 )
 
             # Top pagination controls

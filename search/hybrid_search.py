@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 from config import settings
 from db import GSEMesh, GSESeries, MeshTerm, SessionLocal
 from mesh.query_expand import QueryExpander
+from search.judge import judge as llm_judge
+from search.rewrite import rewrite as llm_rewrite
 from vector.search import semantic_search
 
 logger = logging.getLogger(__name__)
@@ -70,6 +72,47 @@ class HybridSearchEngine:
             f"semantic={use_semantic}, lexical={use_lexical}, mesh={use_mesh}"
         )
 
+        # Step 0: LLM rewriter — extract structured concepts before retrieval.
+        # Controlled by REWRITE_ENABLED=true in .env.
+        # Outputs used downstream:
+        #   - semantic_query: topic concept names joined → cleaner embedding vector
+        #   - filters: organism / date / min_samples auto-parsed from query
+        #   - interpretation, criteria, constraints: passed to judge in Step 7
+        rw_interpretation = ""
+        rw_criteria = ""
+        rw_constraints: list[str] = []
+        semantic_query = query  # default: use raw query if rewriter disabled/fails
+        if settings.rewrite_enabled:
+            try:
+                rw = llm_rewrite(query, effort=settings.rewrite_effort)
+                if not rw["fallback"]:
+                    rw_interpretation = rw["interpretation"]
+                    rw_criteria = rw["criteria"]
+                    rw_constraints = rw["constraints"]
+
+                    # Use topic concept names as semantic query — removes filler
+                    # words ("datasets", "after 2023") that dilute the embedding
+                    if rw["topic_names"]:
+                        semantic_query = " ".join(rw["topic_names"])
+                        logger.info(f"Rewriter: semantic_query='{semantic_query}'")
+
+                    # Rewriter-extracted hard filters (organism, date, min_samples)
+                    # are NOT injected into retrieval — they collapse results too
+                    # aggressively for queries like "COVID-19 datasets from 2020".
+                    # The judge enforces these constraints via the criteria string.
+                    # Caller-supplied filters (from UI dropdowns) still apply as before.
+                    raw = rw.get("raw", {})
+
+                    logger.info(
+                        f"Rewriter: interpretation='{rw_interpretation[:80]}' "
+                        f"exclude={rw['exclude_names']} "
+                        f"filters_added={list(filters.keys())}"
+                    )
+                else:
+                    logger.warning("Rewriter fallback: LLM unavailable, using raw query")
+            except Exception as e:
+                logger.error(f"Rewriter failed, continuing with raw query: {e}", exc_info=True)
+
         # Step 1: MeSH expansion (includes spelling correction pre-pass)
         expansion_result = None
         expanded_query = query
@@ -101,12 +144,17 @@ class HybridSearchEngine:
         semantic_results = []
         if use_semantic:
             try:
+                # When rewriter is active, semantic_query = topic concept names
+                # (e.g. "glioma glioma cells glioma tissue") — a cleaner vector
+                # than the raw query which may contain filler words or date phrases.
+                # When rewriter is off, semantic_query == query (raw, unchanged).
+                _sem_q = semantic_query if settings.rewrite_enabled and semantic_query != query else corrected_query
                 _exp = expanded_query if (use_mesh and expanded_query != corrected_query) else None
                 # Fetch once at the lowest acceptable threshold (0.45); results above
                 # higher thresholds naturally rank first because Milvus returns by score.
                 # This avoids up to 4 redundant round-trips to Milvus.
                 all_semantic = semantic_search(
-                    query=corrected_query,
+                    query=_sem_q,
                     expanded_query=_exp,
                     top_k=settings.semantic_top_k,
                     min_score=0.45,
@@ -178,9 +226,78 @@ class HybridSearchEngine:
             matched_mesh_ids=matched_mesh_ids,
         )
 
+        # Step 7: LLM judge — post-retrieval relevance filter (Phase 1 integration).
+        # Controlled by JUDGE_ENABLED=true in .env. When disabled, results are
+        # returned as-is with tier="unjudged" and reason="" on every result.
+        judge_meta = {"judge_used": False, "relevant_count": 0, "borderline_count": 0,
+                      "unjudged_count": 0, "judge_coverage": 0}
+        if settings.judge_enabled and final_results:
+            to_judge = final_results[:settings.judge_top_k]
+            remainder = final_results[settings.judge_top_k:]
+            try:
+                jd = llm_judge(
+                    query=query,
+                    interpretation=rw_interpretation,
+                    items=to_judge,
+                    constraints=rw_constraints,
+                    criteria=rw_criteria,
+                    effort=settings.judge_effort,
+                )
+                # Attach tier + reason to each judged result
+                for r in to_judge:
+                    call = jd["calls"].get(r["accession"])
+                    if call:
+                        r["tier"] = call["tier"]
+                        r["reason"] = call["reason"]
+                    else:
+                        r["tier"] = "unjudged"
+                        r["reason"] = ""
+                # Remainder (beyond judge_top_k) are unjudged but still returned
+                for r in remainder:
+                    r["tier"] = "unjudged"
+                    r["reason"] = ""
+                # Sort judged results: relevant first, borderline next, unjudged,
+                # not_relevant last — nothing is removed, preserving recall.
+                # Newest-first within each tier.
+                TIER_ORDER = {"relevant": 0, "borderline": 1, "unjudged": 2, "not_relevant": 3}
+                from itertools import groupby
+                to_judge.sort(key=lambda r: TIER_ORDER.get(r.get("tier", "unjudged"), 9))
+                tier_sorted = []
+                for _, grp in groupby(to_judge, key=lambda r: TIER_ORDER.get(r.get("tier", "unjudged"), 9)):
+                    tier_sorted.extend(sorted(grp, key=lambda r: str(r.get("submission_date") or ""), reverse=True))
+                final_results = tier_sorted + remainder
+                judge_meta = {
+                    "judge_used": jd["judged"],
+                    "relevant_count": sum(1 for r in to_judge if r.get("tier") == "relevant"),
+                    "borderline_count": sum(1 for r in to_judge if r.get("tier") == "borderline"),
+                    "not_relevant_count": sum(1 for r in to_judge if r.get("tier") == "not_relevant"),
+                    "unjudged_count": len(jd.get("unjudged", [])),
+                    "judge_coverage": len(to_judge),
+                }
+                logger.info(
+                    f"Judge: relevant={judge_meta['relevant_count']} "
+                    f"borderline={judge_meta['borderline_count']} "
+                    f"not_relevant={judge_meta['not_relevant_count']} "
+                    f"unjudged={judge_meta['unjudged_count']}"
+                )
+            except Exception as e:
+                logger.error(f"Judge failed, returning unfiltered results: {e}", exc_info=True)
+                for r in final_results:
+                    r["tier"] = "unjudged"
+                    r["reason"] = ""
+        else:
+            # Judge disabled: mark all results as unjudged
+            for r in final_results:
+                r.setdefault("tier", "unjudged")
+                r.setdefault("reason", "")
+
         # Prepare metadata
         metadata = {
             "query": query,
+            "interpretation": rw_interpretation,
+            "criteria": rw_criteria,
+            "constraints": rw_constraints,
+            "semantic_query": semantic_query,
             "expanded_query": expanded_query if use_mesh else query,
             "mesh_terms": expansion_result["matched_terms"] if expansion_result else [],
             "semantic_count": len(semantic_results),
@@ -188,6 +305,7 @@ class HybridSearchEngine:
             "mesh_count": len(mesh_only_results),
             "total_results": len(final_results),
             "filters_applied": filters,
+            **judge_meta,
         }
 
         logger.info(f"Hybrid search complete: {len(final_results)} results")
@@ -238,7 +356,11 @@ class HybridSearchEngine:
         original_tsquery = func.plainto_tsquery("english", query)
 
         # Build per-word prefix AND query (catches stemming variants like pancreas/pancreatic)
-        query_words = [w.strip("\"'(),.") for w in query.split() if len(w.strip("\"'(),.")) >= 3]
+        # Known 2-letter biomedical abbreviations that are meaningful query terms
+        KNOWN_SHORT_TERMS = {"ar", "il", "ck", "nk", "pd", "er", "pr"}
+        query_words = [w.strip("\"'(),.") for w in query.split()
+                       if len(w.strip("\"'(),.")) >= 3
+                       or w.strip("\"'(),.").lower() in KNOWN_SHORT_TERMS]
         if len(query_words) > 1:
             # Use prefix matching: 'pancreatic' → 'pancrea:*' catches pancreas/pancreatic
             prefix_parts = " & ".join(f"{w[:6]}:*" for w in query_words)
@@ -269,6 +391,9 @@ class HybridSearchEngine:
             except Exception:
                 pass  # fallback: skip expansion if tsquery syntax fails
 
+        # Hard-coded lexical aliases for terms that FTS tokenizes poorly.
+        # "CAR-T" → PostgreSQL splits to "car" + "t" (both too short/generic).
+        # Inject the full clinical phrase directly into the tsquery instead.
         # OR in each MeSH preferred name as a whole phrase.
         # This is critical for lay-term queries like "heart attack" where the original
         # words don't appear in clinical papers — the MeSH terms drive lexical recall.
@@ -368,9 +493,18 @@ class HybridSearchEngine:
 
         # Date range filter
         if date_range := filters.get("date_range"):
-            start_date = date_range.get("start")
-            end_date = date_range.get("end")
-
+            from datetime import date as _date, datetime as _datetime
+            def _to_date(v):
+                if isinstance(v, _date):
+                    return v
+                if isinstance(v, _datetime):
+                    return v.date()
+                try:
+                    return _date.fromisoformat(str(v)[:10])
+                except (ValueError, TypeError):
+                    return None
+            start_date = _to_date(date_range.get("start"))
+            end_date = _to_date(date_range.get("end"))
             if start_date:
                 conditions.append(GSESeries.submission_date >= start_date)
             if end_date:
@@ -516,15 +650,15 @@ class HybridSearchEngine:
 
         scores: dict[str, float] = {}
 
-        # Weighted RRF: semantic results are given 2× weight relative to lexical
-        # and MeSH-only legs. This prevents broad MeSH tag retrieval (which matches
-        # every dataset tagged with a disease regardless of query aspect, e.g.
-        # "treatment options" vs "genomics") from burying the more precise semantic
-        # signal. Datasets found by semantic search that are also in lexical/MeSH
-        # still accumulate extra score from those legs on top.
+        # Weighted RRF weights (tuned Sep 2026 vs Azure OpenAI embeddings):
+        # - Semantic 2.0: preserves precision for concept/acronym queries
+        # - Lexical 1.5: boosted from 1.0 to improve signaling pathway queries
+        #   (NFkB, TGFb, AR signaling) where keyword matching outperforms semantic
+        # - MeSH 1.5: boosted from 1.0 to lift MeSH-tagged disease/organism datasets
+        #   that regressed vs PubMedBERT (Mycobacterium tuberculosis, HBV-related HCC)
         SEMANTIC_WEIGHT = 2.0
-        LEXICAL_WEIGHT = 1.0
-        MESH_WEIGHT = 1.0
+        LEXICAL_WEIGHT = 1.5
+        MESH_WEIGHT = 1.5
 
         # Add semantic results
         for rank, result in enumerate(semantic_results, start=1):
@@ -685,13 +819,26 @@ class HybridSearchEngine:
         if date_range := filters.get("date_range"):
             if not gse.submission_date:
                 return False
-
-            start_date = date_range.get("start")
-            end_date = date_range.get("end")
-
-            if start_date and gse.submission_date < start_date:
+            from datetime import date as _date, datetime as _datetime
+            def _to_date(v):
+                if v is None:
+                    return None
+                if isinstance(v, _date):
+                    return v
+                if isinstance(v, _datetime):
+                    return v.date()
+                try:
+                    return _date.fromisoformat(str(v)[:10])
+                except (ValueError, TypeError):
+                    return None
+            gse_date = _to_date(gse.submission_date)
+            start_date = _to_date(date_range.get("start"))
+            end_date = _to_date(date_range.get("end"))
+            if gse_date is None:
                 return False
-            if end_date and gse.submission_date > end_date:
+            if start_date and gse_date < start_date:
+                return False
+            if end_date and gse_date > end_date:
                 return False
 
         # Sample count filter

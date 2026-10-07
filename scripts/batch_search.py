@@ -33,6 +33,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+# Load .env before any app imports so Azure credentials are available
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging
 logging.basicConfig(level=logging.WARNING)
 
@@ -128,7 +132,13 @@ def run_query(engine: HybridSearchEngine, query: str, top: int,
                 "query": query,
                 "total_results": len(results),
                 "expanded_query": metadata.get("expanded_query", ""),
+                "interpretation": metadata.get("interpretation", ""),
+                "criteria": metadata.get("criteria", ""),
                 "mesh_terms": [t["preferred_name"] for t in metadata.get("mesh_terms", [])],
+                "judge_used": metadata.get("judge_used", False),
+                "relevant_count": metadata.get("relevant_count", 0),
+                "borderline_count": metadata.get("borderline_count", 0),
+                "not_relevant_count": metadata.get("not_relevant_count", 0),
                 "results": [
                     {
                         "rank": rank,
@@ -143,6 +153,8 @@ def run_query(engine: HybridSearchEngine, query: str, top: int,
                         "matched_mesh_terms": [
                             t["preferred_name"] for t in (r.get("matched_mesh_terms") or [])
                         ],
+                        "tier": r.get("tier", "unjudged"),
+                        "reason": r.get("reason", ""),
                     }
                     for rank, r in enumerate(results, start=1)
                 ],

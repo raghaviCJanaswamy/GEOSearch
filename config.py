@@ -65,8 +65,17 @@ class Settings(BaseSettings):
                                  # The adaptive threshold cascade (0.65→0.45) still controls
                                  # which candidates enter RRF, so ranking quality is preserved.
     lexical_top_k: int = 100
-    final_top_k: int = 500
+    final_top_k: int = 750
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
+
+    # Rewriter (pre-retrieval LLM query understanding)
+    rewrite_enabled: bool = False        # set REWRITE_ENABLED=true to activate
+    rewrite_effort: str = "none"         # LLM reasoning effort: none|low|medium
+
+    # Judge (post-retrieval LLM relevance filter)
+    judge_enabled: bool = False          # set JUDGE_ENABLED=true to activate
+    judge_top_k: int = 150               # how many results to send to the judge
+    judge_effort: str = "none"           # LLM reasoning effort: none|low|medium
 
     # MeSH tagging
     mesh_confidence_threshold: float = 0.3

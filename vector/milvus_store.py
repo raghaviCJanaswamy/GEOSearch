@@ -233,9 +233,10 @@ class MilvusStore:
         if not query_vector:
             return []
 
+        # nprobe=64 gives good recall for IVF_FLAT; ignored by FLAT index
         search_params = {
-            "metric_type": "IP",  # Inner Product
-            "params": {},  # nprobe is IVF-only; FLAT index ignores it
+            "metric_type": "IP",
+            "params": {"nprobe": 64},
         }
 
         logger.debug(f"Searching Milvus: top_k={top_k}, filter={filter_expr}")
@@ -306,6 +307,27 @@ class MilvusStore:
         except MilvusException as e:
             logger.error(f"Count failed: {e}")
             return 0
+
+    def rebuild_index_ivf_flat(self, nlist: int = 1024) -> None:
+        """
+        Rebuild the vector index from FLAT to IVF_FLAT for faster search.
+        Recommended once collection exceeds ~100K vectors.
+
+        Args:
+            nlist: Number of cluster centroids (higher = faster search, less accurate).
+                   Rule of thumb: sqrt(num_entities). Default 1024 suits 100K–1M vectors.
+        """
+        logger.info(f"Rebuilding index to IVF_FLAT (nlist={nlist})...")
+        self.collection.release()
+        self.collection.drop_index()
+        index_params = {
+            "metric_type": "IP",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": nlist},
+        }
+        self.collection.create_index(field_name="embedding", index_params=index_params)
+        self.collection.load()
+        logger.info("Index rebuilt to IVF_FLAT and collection reloaded.")
 
     def drop_collection(self) -> None:
         """

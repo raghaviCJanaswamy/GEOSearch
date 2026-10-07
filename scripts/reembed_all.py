@@ -1,17 +1,19 @@
 """
-Re-embed all GSE corpus records using the configured embedding model.
-Run after changing EMBEDDING_MODEL in .env.
+Re-embed all GSE corpus records using the configured embedding provider.
+
+Reads EMBEDDING_PROVIDER, EMBEDDING_DIMENSION and provider credentials from .env.
+Drops and recreates the Milvus collection when the dimension changes (e.g. switching
+from PubMedBERT 768-dim to text-embedding-3-large 3072-dim).
 
 Usage:
-    python scripts/reembed_all.py
+    python scripts/reembed_all.py [--resume]
+
+    --resume   Skip records already in Milvus (resume interrupted run).
+               Without this flag the collection is dropped and rebuilt from scratch.
 """
 import os
 import sys
 import time
-
-# Must be set before importing project modules so config picks them up
-os.environ.setdefault("EMBEDDING_MODEL", "NeuML/pubmedbert-base-embeddings")
-os.environ.setdefault("EMBEDDING_DIMENSION", "768")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -21,27 +23,60 @@ from db.models import GSESeries
 from geo_ingest.parser import GEOParser
 from vector.milvus_store import MilvusStore
 from vector.embeddings import get_embedding_provider
+from config import settings
 
 BATCH_SIZE = 256
-LOG_EVERY = 256  # log every batch so progress is visible even on small corpora
+LOG_EVERY  = 256
+MAX_RETRIES = 5
+RETRY_BASE_DELAY = 10  # seconds; doubles on each retry (exponential backoff)
+
+
+def embed_with_retry(provider, texts: list[str]) -> list[list[float]]:
+    """Call provider.embed_texts with exponential backoff on rate-limit errors."""
+    delay = RETRY_BASE_DELAY
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            return provider.embed_texts(texts)
+        except Exception as e:
+            msg = str(e).lower()
+            is_rate_limit = any(k in msg for k in ("429", "rate limit", "too many requests", "throttl"))
+            if is_rate_limit and attempt < MAX_RETRIES:
+                print(f"  Rate limit hit — waiting {delay}s (attempt {attempt}/{MAX_RETRIES})", flush=True)
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
+            else:
+                raise
 
 
 def main():
-    print(f"Embedding model: {os.environ['EMBEDDING_MODEL']}", flush=True)
+    resume = "--resume" in sys.argv
+
+    print(f"Embedding provider  : {settings.embedding_provider}", flush=True)
+    print(f"Embedding dimension : {settings.embedding_dimension}", flush=True)
 
     print("Loading provider...", flush=True)
     provider = get_embedding_provider()
+    actual_dim = provider.get_dimension()
+    print(f"Provider dimension  : {actual_dim}", flush=True)
 
     print("Connecting to Milvus...", flush=True)
     store = MilvusStore()
+
+    if not resume:
+        print("Dropping existing Milvus collection to rebuild with new dimension...", flush=True)
+        store.drop_collection()
+        # Re-init store so it creates a fresh collection with the new dimension
+        store = MilvusStore()
+        print(f"New collection created (dim={store.dimension}).", flush=True)
+    else:
+        print("Resume mode: existing vectors will be kept; only missing accessions embedded.", flush=True)
+
     parser = GEOParser()
-
     db = SessionLocal()
-    total = db.query(GSESeries).count()
-    print(f"Total records to re-embed: {total:,}", flush=True)
 
-    # Pre-load all MeSH tags into memory as accession → [preferred_name, ...]
-    # This avoids N+1 queries during the embedding loop.
+    total = db.query(GSESeries).count()
+    print(f"Total records       : {total:,}", flush=True)
+
     print("Loading MeSH tags...", flush=True)
     mesh_rows = db.execute(text("""
         SELECT gm.accession, mt.preferred_name
@@ -51,9 +86,10 @@ def main():
     mesh_map: dict[str, list[str]] = {}
     for acc, name in mesh_rows:
         mesh_map.setdefault(acc, []).append(name)
-    print(f"Loaded MeSH tags for {len(mesh_map):,} datasets.", flush=True)
+    print(f"MeSH tags loaded for {len(mesh_map):,} datasets.", flush=True)
 
     done = 0
+    errors = 0
     t_start = time.time()
     last_accession = ""
 
@@ -82,13 +118,18 @@ def main():
             texts.append(parser.prepare_embedding_text(parsed))
             accessions.append(gse.accession)
 
-        embeddings = provider.embed_texts(texts)
-        pairs = list(zip(accessions, embeddings))
-        store.upsert_embeddings(pairs)
-        done += len(pairs)
+        try:
+            embeddings = embed_with_retry(provider, texts)
+            pairs = list(zip(accessions, embeddings))
+            store.upsert_embeddings(pairs)
+            done += len(pairs)
+        except Exception as e:
+            print(f"  ERROR on batch ending {batch[-1].accession}: {e}", flush=True)
+            errors += 1
+
         last_accession = batch[-1].accession
 
-        if done % LOG_EVERY == 0 or done == total:
+        if done % LOG_EVERY == 0 or done >= total - BATCH_SIZE:
             elapsed = time.time() - t_start
             rate = done / elapsed if elapsed > 0 else 0
             eta = (total - done) / rate if rate > 0 else 0
@@ -103,12 +144,12 @@ def main():
 
     db.close()
 
-    print("Flushing Milvus collection...", flush=True)
-    store.collection.flush()
-    print("Flush complete.", flush=True)
-
     elapsed = time.time() - t_start
-    print(f"Re-embedding complete. {done:,} records in {elapsed/60:.1f} min.", flush=True)
+    print(
+        f"\nRe-embedding complete. {done:,} records in {elapsed/60:.1f} min. "
+        f"Errors: {errors}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
