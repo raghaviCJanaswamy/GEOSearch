@@ -363,6 +363,12 @@ class HybridSearchEngine:
         with NCBI's behaviour where all query concepts must appear in the record.
         MeSH preferred names are used as the representative token per group.
         """
+        # Convert query to a PostgreSQL websearch tsquery (handles phrases, AND, OR)
+        # Falls back to plain to_tsquery if empty after stripping short tokens
+        tsquery = func.websearch_to_tsquery("english", query)
+
+        # Build a weighted tsvector over title (A), summary (B), overall_design (C)
+        # setweight gives title matches a higher rank than summary matches
         tsvec = func.setweight(
             func.to_tsvector("english", func.coalesce(GSESeries.title, "")), "A"
         ).op("||")(
@@ -485,6 +491,7 @@ class HybridSearchEngine:
             self.db.query(GSESeries.accession, ts_rank.label("rank"))
             .filter(base_filter)
             .order_by(ts_rank.desc())
+            .limit(top_k)
             .all()
         )
 

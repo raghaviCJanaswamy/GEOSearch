@@ -58,14 +58,9 @@ GENERIC_MODIFIER_WORDS: frozenset[str] = frozenset({
 # gates in _find_matching_mesh_terms but whose expansion IS a valid MeSH preferred name
 # or entry_term. Each alias is the full form used in MeSH preferred_name / entry_terms.
 LAY_TERM_ALIASES: dict[str, list[str]] = {
-    # "throat" only maps to Pharyngitis/Pharynx in MeSH — no cancer mapping
-    "throat cancer": ["head and neck neoplasms", "oropharyngeal neoplasms",
-                      "laryngeal neoplasms", "nasopharyngeal carcinoma",
-                      "squamous cell carcinoma of head and neck"],
-    "throat": ["pharynx", "oropharynx", "larynx", "nasopharynx"],
-    # "heart attack" not in MeSH entry_terms
+    "cancer": ["neoplasm", "neoplasms", "carcinoma", "tumor", "tumour"],
     "heart attack": ["myocardial infarction", "cardiac infarction"],
-    # "high blood pressure" not a MeSH entry term
+    "stroke": ["cerebrovascular accident", "brain ischemia"],
     "high blood pressure": ["hypertension"],
     # "blood cancer" not in MeSH
     "blood cancer": ["leukemia", "lymphoma", "multiple myeloma", "hematologic neoplasms"],
@@ -358,8 +353,6 @@ class QueryExpander:
         def _add(term: MeshTerm, priority: int) -> None:
             if term.mesh_id in seen_ids:
                 return
-            if term.mesh_id in OVERLY_BROAD_MESH_IDS:
-                return
             seen_ids.add(term.mesh_id)
             matches.append({
                 "mesh_id": term.mesh_id,
@@ -375,8 +368,6 @@ class QueryExpander:
             return " " not in token and token.lower() in GENERIC_MODIFIER_WORDS
 
         # Pass 1: exact preferred name match (highest priority)
-        # Single short words like "breast", "heart", "lung" are anatomical terms
-        # that match too broadly — require either multi-word tokens or longer words (>=8 chars)
         for token in tokens:
             if len(token) < 3:
                 continue
@@ -397,7 +388,7 @@ class QueryExpander:
         # Uses a lateral join because jsonb_array_elements_text is a set-returning function
         # and cannot appear in a WHERE clause directly.
         for token in tokens:
-            if len(token) < 6:
+            if len(token) < 3:
                 continue
             if _is_generic_single(token):
                 continue
@@ -425,7 +416,7 @@ class QueryExpander:
         # with a space (e.g. token "breast neoplasms" → "Breast Neoplasms Male" ok,
         # "Breast Neoplasms, Male" NOT ok — comma-qualified variants require explicit query match).
         for token in tokens:
-            if len(token) < 8 and " " not in token:
+            if len(token) < 5:
                 continue
             if _is_generic_single(token):
                 continue
@@ -439,10 +430,9 @@ class QueryExpander:
                     continue  # comma/punctuation qualifier not in query — skip
                 _add(t, 2)
 
-        # Pass 4: partial preferred name match — multi-word tokens only to prevent
-        # single adjectives like "pancreatic" matching unrelated descriptors
+        # Pass 4: partial preferred name match (fallback)
         for token in tokens:
-            if len(token) < 5 or " " not in token:
+            if len(token) < 5:
                 continue
             current_token[0] = token
             results = self.db.query(MeshTerm).filter(
@@ -468,7 +458,7 @@ class QueryExpander:
         # Uses a lateral join because jsonb_array_elements_text is a set-returning function
         # and cannot appear in a WHERE clause directly.
         for token in tokens:
-            if len(token) < 6 or " " not in token:
+            if len(token) < 4:
                 continue
             current_token[0] = token
             rows = self.db.execute(

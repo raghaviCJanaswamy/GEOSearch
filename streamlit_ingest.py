@@ -16,10 +16,7 @@ from db import IngestRun, get_db, engine, init_db
 from db.session import SessionLocal
 from db.models import GSESeries, MeshTerm, IngestRun as IngestRunModel
 from geo_ingest.ingest_pipeline import IngestionPipeline
-from geo_ingest.parser import GEOParser
 from streamlit_ingest_mesh import show_mesh_loader
-from vector.embeddings import get_embedding_provider
-from vector.milvus_store import MilvusStore
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +56,10 @@ def show_ingestion_interface() -> None:
         show_query_ingestion()
 
     with tab2:
-        show_file_import()
+        if db_available:
+            show_ingestion_history()
+        else:
+            st.info("Ingestion history will be available once database is ready.")
 
     with tab3:
         if db_available:
@@ -75,6 +75,9 @@ def show_ingestion_interface() -> None:
 
     with tab5:
         show_ingestion_config()
+    
+    with tab4:
+        show_database_initialization()
 
     with tab6:
         show_database_initialization()
@@ -97,15 +100,40 @@ def show_query_ingestion() -> None:
     """Show interface for ingesting by search query."""
     st.subheader("Search and Ingest")
 
-    cq_col1, cq_col2 = st.columns([3, 1])
-    with cq_col1:
-        query = st.text_input(
-            "Search Query",
-            placeholder="e.g., 'breast cancer RNA-seq' or 'melanoma microarray'",
-            help="Enter your NCBI search query",
-        )
-    with cq_col2:
-        organism = st.selectbox("Species", options=ORGANISM_OPTIONS, index=0, key="cq_organism")
+    # Quick ingest presets
+    st.markdown("### Quick Start")
+    quick_presets = {
+        "🔬 Cancer Research": {"query": "cancer", "retmax": 10},
+        "🧬 RNA-seq": {"query": "RNA-seq", "retmax": 10},
+        "🦠 COVID-19": {"query": "COVID-19", "retmax": 10},
+        "🧠 Brain": {"query": "brain", "retmax": 10},
+    }
+
+    col1, col2, col3, col4 = st.columns(4)
+    quick_cols = [col1, col2, col3, col4]
+
+    for idx, (label, params) in enumerate(quick_presets.items()):
+        with quick_cols[idx]:
+            if st.button(label, use_container_width=True, key=f"quick_{idx}"):
+                ingest_with_progress(
+                    query=params["query"],
+                    retmax=params["retmax"],
+                    skip_existing=True,
+                )
+                st.rerun()
+
+    st.markdown("---")
+
+    # Custom query input
+    st.markdown("### Custom Query")
+    query = st.text_input(
+        "Search Query",
+        placeholder="e.g., 'breast cancer RNA-seq' or 'melanoma microarray'",
+        help="Enter your NCBI search query",
+    )
+
+    # Advanced options
+    col1, col2 = st.columns(2)
 
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -127,16 +155,18 @@ def show_query_ingestion() -> None:
             st.error("Please enter a search query")
             return
 
+        # Check database before starting
         try:
             db_test = next(get_db())
             db_test.close()
         except Exception as e:
-            st.error(f"Cannot start ingestion: Database not ready\n\nError: {str(e)}")
+            st.error(
+                f"Cannot start ingestion: Database not ready\n\n"
+                f"Error: {str(e)}\n\n"
+                f"**Please wait**: The system is initializing PostgreSQL.\n"
+                f"Refresh the page in 30-60 seconds."
+            )
             return
-
-        full_query = query
-        if organism != "Any":
-            full_query = f"{query} AND {organism}[Organism]"
 
         ingest_with_progress(
             query=full_query,

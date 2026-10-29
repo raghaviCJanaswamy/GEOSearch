@@ -15,8 +15,7 @@ services:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-geouser} -d ${POSTGRES_DB:-geosearch}"]
       interval: 10s
       timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 5
     restart: unless-stopped
     networks:
       - geosearch-network
@@ -35,10 +34,10 @@ services:
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
     healthcheck:
       test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
     networks:
       - geosearch-network
@@ -58,10 +57,10 @@ services:
     command: minio server /minio_data --console-address ":9001"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 15
-      start_period: 30s
+      retries: 10
+      start_period: 5s
     restart: unless-stopped
     networks:
       - geosearch-network
