@@ -1,615 +1,249 @@
-# GEOSearch: AI-Powered Semantic Search for NCBI GEO Datasets
+# GEOSearch: AI-Powered Semantic Search for NCBI GEO
 
-A production-ready system for intelligent search over NCBI GEO (Gene Expression Omnibus) metadata using semantic search, keyword matching, and MeSH terminology expansion.
+GEOSearch is an open-source hybrid search engine for [NCBI GEO](https://www.ncbi.nlm.nih.gov/geo/) dataset discovery. It combines dense semantic embeddings, PostgreSQL full-text search, and MeSH ontology expansion — fused by Reciprocal Rank Fusion — with an optional LLM relevance judge and on-demand expression matrix retrieval from ARCHS4.
+
+**Live deployment:** http://149.165.172.79:8501
+**API docs:** http://149.165.172.79:8080/docs
+**MCP endpoint:** http://149.165.172.79:8090/mcp
+
+---
 
 ## Features
 
-- **Semantic Search**: AI-powered similarity search using sentence transformers or OpenAI embeddings
-- **Keyword Search**: Traditional lexical search with PostgreSQL full-text capabilities
-- **MeSH Integration**: Medical Subject Headings terminology expansion for biomedical queries
-- **Hybrid Ranking**: Reciprocal Rank Fusion (RRF) combining multiple search strategies
-- **Real-time GEO Data**: Direct ingestion from NCBI E-utilities with rate limiting and retries
-- **Interactive UI**: Streamlit-based web interface with filters and result highlighting
-- **Structured Filters**: Filter by organism, technology type, date range, sample count
-- **Production Ready**: Docker-compose deployment, comprehensive logging, error handling
+- **Semantic search** — Azure OpenAI `text-embedding-3-large` (3072-dim) over 263,000+ GSE records in Milvus IVF_FLAT
+- **Lexical search** — PostgreSQL `ts_rank_cd` with weighted tsvector (title > summary > design)
+- **MeSH expansion** — MeSH 2024 synonym expansion with word-boundary-safe matching (30,764 terms)
+- **Hybrid RRF fusion** — Weighted Reciprocal Rank Fusion (semantic ×2.0, lexical ×1.5, k=60)
+- **LLM relevance judge** — Post-retrieval tier assignment (Best / Possible / Low) with one-sentence rationale
+- **Expression matrix API** — On-demand retrieval from ARCHS4 H5 (67,186 genes × 1,098,771 samples), no intermediate download
+- **REST API** — FastAPI with JSON, streaming TSV, and multipart response modes
+- **MCP interface** — Model Context Protocol tool for AI agent integration
+- **Multi-species corpus** — Human, mouse, rat, Drosophila, zebrafish, Arabidopsis, yeast, C. elegans
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   Streamlit UI  │
-└────────┬────────┘
-         │
-┌────────▼────────────────────────────┐
-│      Hybrid Search Engine           │
-│  ┌──────────┬──────────┬─────────┐ │
-│  │ Semantic │ Lexical  │  MeSH   │ │
-│  │  Search  │  Search  │ Expand  │ │
-│  └──────────┴──────────┴─────────┘ │
-└────────┬────────────────────────────┘
-         │
-    ┌────┴─────┐
-    │          │
-┌───▼───┐  ┌──▼──────┐
-│ Milvus│  │Postgres │
-│Vector │  │Metadata │
-│  DB   │  │ + MeSH  │
-└───────┘  └─────────┘
-    │          │
-    └────┬─────┘
-         │
-   ┌─────▼──────┐
-   │ NCBI GEO   │
-   │ E-utilities│
-   └────────────┘
+User Query
+    │
+    ├─ MeSH Expansion ──► expanded_query
+    │
+    ├─ Semantic  (Milvus IVF_FLAT, top-1000, cosine ≥ 0.45) ──┐
+    ├─ Lexical   (PostgreSQL FTS, top-100)                     ─┼─► RRF Fusion ──► LLM Judge ──► Results
+    └─ (MeSH tokens appended to both paths)                    ─┘
+
+Results ──► Streamlit UI
+        ──► FastAPI REST API  (/search, /ask, /expression/{accession})
+        ──► MCP Tool          (search_geo, get_dataset)
+        ──► ARCHS4 H5         (expression matrix on demand)
 ```
+
+---
 
 ## Tech Stack
 
-- **Language**: Python 3.11+
-- **UI**: Streamlit
-- **Database**: PostgreSQL (metadata + MeSH)
-- **Vector DB**: Milvus (embeddings)
-- **Embeddings**: sentence-transformers (local) or OpenAI
-- **Data Source**: NCBI E-utilities API
-- **ORM**: SQLAlchemy with Alembic
-- **Search**: Hybrid (semantic + lexical + MeSH)
+| Layer | Technology |
+|---|---|
+| Language | Python 3.11+ |
+| UI | Streamlit |
+| API | FastAPI + Uvicorn |
+| Metadata DB | PostgreSQL 15 |
+| Vector DB | Milvus 2.3 (IVF_FLAT, nlist=1024) |
+| Embeddings | Azure OpenAI `text-embedding-3-large` (3072-dim) |
+| LLM Judge | Azure OpenAI `gpt-6-luna` |
+| Expression data | ARCHS4 v2 H5 (`human_gene_v2.latest.h5`) via h5py |
+| ORM | SQLAlchemy 2 |
+| Config | pydantic-settings |
+| Deployment | Docker Compose (arm64 local / amd64 VM) |
+
+---
+
+## Corpus
+
+| Species | Records |
+|---|---|
+| Homo sapiens | 135,159 |
+| Mus musculus | ~96,000 |
+| Drosophila melanogaster | ~6,900 |
+| Arabidopsis thaliana | ~6,800 |
+| Rattus norvegicus | ~6,200 |
+| Caenorhabditis elegans | ~4,700 |
+| Saccharomyces cerevisiae | ~4,400 |
+| Danio rerio | ~3,000 |
+| **Total** | **263,155** |
+
+---
 
 ## Quick Start
 
 ### Prerequisites
 
 - Docker and Docker Compose
-- Python 3.11+
-- 8GB RAM minimum (for local embeddings)
-- NCBI account email (for E-utilities)
+- Azure OpenAI API key and endpoint (for embeddings and judge)
+- ARCHS4 H5 file (`human_gene_v2.latest.h5`) — obtain from [maayanlab.cloud/archs4](https://maayanlab.cloud/archs4/)
+- NCBI email (for E-utilities ingestion)
 
-### 1. Clone and Setup
+### 1. Clone and configure
 
 ```bash
-# Clone repository
+git clone <repo-url>
 cd GEOSearch
-
-# Copy environment template
 cp .env.example .env
-
-# Edit .env and set your email
-# NCBI_EMAIL=your.email@example.com
+# Edit .env — set AZURE_OPENAI_API_KEY, AZURE_OPENAI_ENDPOINT, NCBI_EMAIL
 ```
 
-### 2. Start Services
+### 2. Place ARCHS4 H5 file
 
 ```bash
-# Start PostgreSQL, Milvus, and dependencies
-docker-compose up -d
-
-# Wait for services to be healthy (30-60 seconds)
-docker-compose ps
+# Place the file at the repo root (excluded from Docker build context via .dockerignore)
+ls human_gene_v2.latest.h5
 ```
 
-### 3. Install Python Dependencies
+### 3. Start the stack
 
 ```bash
-# Create virtual environment
-python3.11 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+docker compose up -d
 ```
 
-### 4. Initialize Database
+Services start in order: PostgreSQL → Milvus → init → app + API.
+
+| Service | URL |
+|---|---|
+| Streamlit UI | http://localhost:8501 |
+| FastAPI | http://localhost:8080 |
+| API Docs | http://localhost:8080/docs |
+| MCP | http://localhost:8090/mcp |
+
+---
+
+## Environment Variables
+
+Key settings in `.env` (see `config.py` for full list):
 
 ```bash
-# Create database tables
-python -m geo_ingest.ingest_pipeline init
+# Azure OpenAI (required)
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_ENDPOINT=https://....openai.azure.com/
+AZURE_OPENAI_API_VERSION=2024-02-01
+AZURE_OPENAI_DEPLOYMENT=text-embedding-3-large
 
-# Load sample MeSH terms (for testing)
-python -m mesh.loader --sample --init-db
+# Embeddings
+EMBEDDING_PROVIDER=azure_openai
+EMBEDDING_MODEL=text-embedding-3-large
+EMBEDDING_DIMENSION=3072
 
-# OR: Load full MeSH descriptors (download desc2026.xml first)
-# python -m mesh.loader --file /path/to/desc2026.xml
+# NCBI
+NCBI_EMAIL=your.email@example.com
+
+# Search tuning
+SEMANTIC_TOP_K=1000
+LEXICAL_TOP_K=100
+FINAL_TOP_K=750
+RRF_K=60
+
+# Judge
+JUDGE_ENABLED=true
+JUDGE_TOP_K=150
+REWRITE_ENABLED=false
 ```
 
-### 5. Ingest GEO Data
+---
+
+## API Reference
+
+### Search
 
 ```bash
-# Ingest datasets by search query (recommended for first run)
-python -m geo_ingest.ingest_pipeline query \
-    --query "breast cancer RNA-seq" \
-    --retmax 50
+# JSON results
+curl "http://localhost:8080/search?query=breast+cancer+RNA-seq&top_k=20"
 
-# Or ingest by specific accessions
-python -m geo_ingest.ingest_pipeline accessions \
-    GSE123456 GSE123457 GSE123458
+# With judge disabled
+curl "http://localhost:8080/search?query=MASLD+liver&use_judge=false"
+
+# Streaming TSV of expression matrices
+curl "http://localhost:8080/search?query=hepatocellular+carcinoma&format=tsv&expression_genes=TP53,MYC"
 ```
 
-### 6. Launch UI
+### Expression Matrix
 
 ```bash
-# Start Streamlit app
-streamlit run app.py
+# Expression info for a GSE
+curl "http://localhost:8080/expression/GSE123456"
 
-# Open browser to http://localhost:8501
+# Download expression matrix as TSV (specific genes)
+curl "http://localhost:8080/expression/GSE123456/download?genes=TP53,BRCA1,MYC"
 ```
 
-## Detailed Setup
+### MCP (AI Agents)
 
-### Environment Configuration
+Add to Claude Desktop `config.json`:
 
-Edit `.env` file:
-
-```bash
-# PostgreSQL
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=geosearch
-POSTGRES_USER=geouser
-POSTGRES_PASSWORD=geopass
-
-# Milvus
-MILVUS_HOST=localhost
-MILVUS_PORT=19530
-
-# NCBI (REQUIRED)
-NCBI_EMAIL=your.email@example.com  # TODO: Set your email
-NCBI_TOOL=GEOSearch
-NCBI_API_KEY=  # Optional: increases rate limit to 10 req/s
-RATE_LIMIT_QPS=3
-
-# Embeddings (choose provider)
-EMBEDDING_PROVIDER=local  # or 'openai'
-EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
-EMBEDDING_DIMENSION=384
-
-# For OpenAI (if EMBEDDING_PROVIDER=openai)
-OPENAI_API_KEY=  # TODO: Set if using OpenAI
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+```json
+{
+  "mcpServers": {
+    "geosearch": { "type": "http", "url": "http://149.165.172.79:8090/mcp" }
+  }
+}
 ```
 
-### MeSH Data Setup
+Tools available: `search_geo`, `get_dataset`
 
-**Option 1: Sample Data (Quick Start)**
-```bash
-python -m mesh.loader --sample
-```
-
-**Option 2: Full MeSH Descriptors**
-```bash
-# Download MeSH descriptors
-wget https://nlmpubs.nlm.nih.gov/projects/mesh/MESH_FILES/xmlmesh/desc2026.xml
-
-# Load into database
-python -m mesh.loader --file desc2026.xml
-```
-
-### Data Ingestion
-
-**Search-based ingestion** (recommended):
-```bash
-# Ingest datasets matching a query
-python -m geo_ingest.ingest_pipeline query \
-    --query "single-cell RNA-seq human" \
-    --retmax 100 \
-    --mindate 2020/01/01 \
-    --maxdate 2024/12/31
-```
-
-**Accession-based ingestion**:
-```bash
-# Ingest specific datasets
-python -m geo_ingest.ingest_pipeline accessions \
-    GSE123456 GSE123457 GSE123458
-```
-
-**Batch ingestion from file**:
-```bash
-# Create file with one accession per line
-cat accessions.txt
-GSE123456
-GSE123457
-GSE123458
-
-# Ingest
-cat accessions.txt | xargs python -m geo_ingest.ingest_pipeline accessions
-```
-
-### MeSH Tagging
-
-After ingestion, tag datasets with MeSH terms:
-
-```python
-from db import get_db
-from mesh.matcher import tag_all_gse_records
-
-db = next(get_db())
-count = tag_all_gse_records(db, confidence_threshold=0.3)
-print(f"Created {count} MeSH associations")
-```
-
-## Usage Examples
-
-### Python API
-
-**Basic search**:
-```python
-from search import search_geo
-
-results = search_geo(
-    query="breast cancer RNA-seq",
-    top_k=50
-)
-
-for result in results["results"]:
-    print(f"{result['accession']}: {result['title']}")
-```
-
-**Search with filters**:
-```python
-from datetime import datetime
-from search import search_geo
-
-results = search_geo(
-    query="diabetes gene expression",
-    filters={
-        "organisms": ["Homo sapiens"],
-        "tech_type": "rna-seq",
-        "date_range": {
-            "start": datetime(2020, 1, 1),
-            "end": datetime(2024, 12, 31)
-        },
-        "min_samples": 10
-    },
-    top_k=100
-)
-```
-
-**Custom hybrid search**:
-```python
-from db import get_db
-from search import HybridSearchEngine
-
-db = next(get_db())
-engine = HybridSearchEngine(db)
-
-results = engine.search(
-    query="lung cancer microarray",
-    use_semantic=True,
-    use_lexical=True,
-    use_mesh=True,
-    top_k=50
-)
-```
-
-### Web UI
-
-1. Start Streamlit: `streamlit run app.py`
-2. Enter search query (e.g., "breast cancer RNA-seq")
-3. Apply filters in sidebar:
-   - Select organisms
-   - Choose technology type
-   - Set date range
-   - Set minimum sample count
-4. Toggle search options:
-   - Semantic search (AI-powered)
-   - Keyword search (traditional)
-   - MeSH expansion (terminology)
-5. View results with:
-   - Matched MeSH terms
-   - Highlighted snippets
-   - Link to GEO page
-   - Expandable details
+---
 
 ## Project Structure
 
 ```
 GEOSearch/
-├── app.py                      # Streamlit UI
-├── config.py                   # Configuration management
-├── requirements.txt            # Python dependencies
-├── pyproject.toml             # Project metadata
-├── docker-compose.yml         # Service orchestration
-├── .env.example               # Environment template
-├── README.md                  # This file
-│
-├── db/                        # Database layer
-│   ├── __init__.py
-│   ├── models.py              # SQLAlchemy models
-│   └── session.py             # DB session management
-│
-├── geo_ingest/                # GEO data ingestion
-│   ├── __init__.py
-│   ├── ncbi_client.py         # NCBI E-utilities client
-│   ├── parser.py              # Metadata parser
-│   └── ingest_pipeline.py     # Main ingestion CLI
-│
-├── vector/                    # Vector storage
-│   ├── __init__.py
-│   ├── embeddings.py          # Embedding providers
-│   ├── milvus_store.py        # Milvus operations
-│   └── search.py              # Semantic search
-│
-├── mesh/                      # MeSH integration
-│   ├── __init__.py
-│   ├── loader.py              # MeSH data loader
-│   ├── matcher.py             # Dataset MeSH tagging
-│   └── query_expand.py        # Query expansion
-│
-├── search/                    # Hybrid search
-│   ├── __init__.py
-│   └── hybrid_search.py       # Hybrid search engine
-│
-└── tests/                     # Unit tests
-    ├── __init__.py
-    ├── conftest.py
-    ├── test_parser.py
-    ├── test_mesh_matcher.py
-    └── test_query_expand.py
+├── app.py                    # Streamlit UI
+├── api.py                    # FastAPI REST API
+├── mcp_server.py             # MCP tool server
+├── config.py                 # Settings (pydantic-settings)
+├── db/
+│   ├── models.py             # GSESeries SQLAlchemy model
+│   └── __init__.py
+├── expression/
+│   └── archs4.py             # ARCHS4 H5 accessor + singleton
+├── search/
+│   ├── hybrid_search.py      # RRF pipeline
+│   ├── judge.py              # LLM relevance judge
+│   ├── rewrite.py            # LLM query rewriter (disabled)
+│   └── llm.py                # Azure OpenAI helper
+├── mesh/
+│   └── query_expand.py       # MeSH expansion
+├── vector/
+│   ├── embeddings.py         # Embedding providers
+│   └── milvus_store.py       # Milvus operations
+├── geo_ingest/
+│   └── ingest_pipeline.py    # GEO metadata ingestion
+├── scripts/
+│   ├── init_database.py      # Schema init
+│   ├── gap_fill_ingest.py    # Gap-fill ingestion (resumable)
+│   └── batch_search.py       # Benchmark runner
+├── benchmarks-detailed/      # Benchmark ground truth + results
+├── docs/                     # Manuscript, project status
+├── docker-compose.yml        # Local (arm64) stack
+├── docker-compose.linux.yml  # Remote VM (amd64) stack
+└── requirements.txt
 ```
 
-## Development
-
-### Running Tests
-
-```bash
-# Run all tests
-pytest
-
-# Run with coverage
-pytest --cov=. --cov-report=html
-
-# Run specific test file
-pytest tests/test_parser.py
-
-# Run with verbose output
-pytest -v
-```
-
-### Code Quality
-
-```bash
-# Format code
-black .
-
-# Sort imports
-isort .
-
-# Type checking
-mypy .
-```
-
-### Database Migrations
-
-```bash
-# Create migration
-alembic revision --autogenerate -m "Description"
-
-# Apply migrations
-alembic upgrade head
-
-# Rollback
-alembic downgrade -1
-```
-
-## Troubleshooting
-
-### Milvus Connection Errors
-
-```bash
-# Check Milvus health
-docker-compose ps milvus
-
-# View logs
-docker-compose logs milvus
-
-# Restart Milvus
-docker-compose restart milvus
-```
-
-**Fallback**: The system gracefully degrades to lexical-only search if Milvus is unavailable.
-
-### PostgreSQL Issues
-
-```bash
-# Check connection
-docker-compose ps postgres
-
-# Access psql
-docker-compose exec postgres psql -U geouser -d geosearch
-
-# Reset database
-docker-compose down -v  # WARNING: Deletes all data
-docker-compose up -d
-python -m geo_ingest.ingest_pipeline init
-```
-
-### NCBI Rate Limiting
-
-If you see 429 errors:
-
-1. Reduce `RATE_LIMIT_QPS` in `.env`
-2. Get an NCBI API key (increases limit to 10 req/s)
-3. Add `NCBI_API_KEY` to `.env`
-
-### Memory Issues
-
-For large ingestions:
-
-```python
-# Process in smaller batches
-for i in range(0, 1000, 100):
-    python -m geo_ingest.ingest_pipeline query \
-        --query "cancer" \
-        --retmax 100 \
-        --retstart $i
-```
-
-### Embedding Model Download
-
-First run downloads the model (~100MB for all-MiniLM-L6-v2):
-
-```bash
-# Pre-download model
-python -c "from sentence_transformers import SentenceTransformer; \
-           SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')"
-```
-
-## Performance
-
-### Benchmarks
-
-- **Ingestion**: ~10-30 datasets/minute (limited by NCBI API)
-- **Embedding**: ~1000 texts/second (local), ~100 texts/second (OpenAI)
-- **Search latency**: 100-500ms for hybrid search
-- **Database**: Handles 100K+ datasets efficiently
-
-### Optimization Tips
-
-1. **Use NCBI API key** for faster ingestion
-2. **Batch operations** when processing many datasets
-3. **Index optimization** in PostgreSQL for large collections
-4. **Milvus IVF_FLAT** index settings for your data size
-5. **Cache embeddings** to avoid regeneration
-
-## Deployment
-
-### Production Deployment
-
-1. **Use production database** with connection pooling
-2. **Add nginx** reverse proxy for Streamlit
-3. **Set up monitoring** (logs, metrics, health checks)
-4. **Scale Milvus** with distributed setup for large data
-5. **Backup** PostgreSQL regularly
-6. **Use secrets management** for credentials
-
-### Docker Production Build
-
-```dockerfile
-# Dockerfile for production
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0"]
-```
-
-## API Reference
-
-### Ingestion Pipeline
-
-```python
-from geo_ingest import IngestionPipeline
-from db import get_db
-
-db = next(get_db())
-pipeline = IngestionPipeline(db)
-
-# Ingest by query
-stats = pipeline.ingest_by_query(
-    query="cancer RNA-seq",
-    retmax=100,
-    skip_existing=True
-)
-
-# Ingest by accessions
-stats = pipeline.ingest_by_accessions(
-    accessions=["GSE123456", "GSE123457"],
-    skip_existing=True
-)
-```
-
-### Hybrid Search
-
-```python
-from search import HybridSearchEngine
-from db import get_db
-
-db = next(get_db())
-engine = HybridSearchEngine(db)
-
-results = engine.search(
-    query="breast cancer",
-    filters={
-        "organisms": ["Homo sapiens"],
-        "tech_type": "rna-seq"
-    },
-    use_semantic=True,
-    use_lexical=True,
-    use_mesh=True,
-    top_k=50
-)
-```
-
-### MeSH Integration
-
-```python
-from mesh import QueryExpander, MeSHMatcher
-from db import get_db
-
-db = next(get_db())
-
-# Expand query
-expander = QueryExpander(db)
-result = expander.expand_query("breast cancer")
-print(result["expanded_query"])
-
-# Tag datasets
-matcher = MeSHMatcher(db)
-matches = matcher.match_gse("GSE123456")
-```
-
-## Contributing
-
-Contributions welcome! Areas for improvement:
-
-- [ ] Advanced MeSH hierarchy navigation
-- [ ] PubMed integration for citation analysis
-- [ ] Machine learning for relevance tuning
-- [ ] Export results (CSV, JSON, BibTeX)
-- [ ] Saved searches and alerts
-- [ ] Multi-language support
-- [ ] GraphQL API
-- [ ] Advanced visualizations
+---
 
 ## License
 
-MIT License - see LICENSE file
+MIT — see LICENSE file.
 
 ## Citation
 
-If you use GEOSearch in your research, please cite:
-
 ```bibtex
-@software{geosearch2024,
-  title = {GEOSearch: AI-Powered Semantic Search for NCBI GEO Datasets},
-  year = {2024},
-  url = {https://github.com/yourusername/GEOSearch}
+@software{geosearch2026,
+  title  = {GEOSearch: AI-Powered Semantic Search for NCBI GEO},
+  author = {Ge, Xijin and Janaswamy, Raghavi},
+  year   = {2026},
+  url    = {https://github.com/sdsu-comp-bio/GEOSearch}
 }
 ```
 
-## Acknowledgments
+## Acknowledgements
 
-- **NCBI GEO**: Data source
-- **NLM MeSH**: Medical terminology
-- **Milvus**: Vector database
-- **Sentence Transformers**: Embedding models
-- **Streamlit**: UI framework
-
-## Support
-
-For issues, questions, or contributions:
-- Open an issue on GitHub
-- Email: your.email@example.com
-
-## Changelog
-
-### v0.1.0 (2024-01)
-- Initial release
-- Hybrid search implementation
-- MeSH integration
-- Streamlit UI
-- Docker deployment
+NCBI GEO and ARCHS4 teams for open-access genomics data infrastructure.
