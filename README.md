@@ -243,7 +243,6 @@ MIT — see LICENSE file.
   url    = {https://github.com/sdsu-comp-bio/GEOSearch}
 }
 ```
-
 ## Acknowledgements
 
 NCBI GEO and ARCHS4 teams for open-access genomics data infrastructure.
