@@ -156,7 +156,7 @@ st.set_page_config(
     page_title="GEO Datasets - Smart Search",
     page_icon="🔬",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # Reset persisted sidebar collapse state so left menu remains visible.
@@ -392,7 +392,7 @@ def perform_search(
     use_mesh: bool,
     use_judge: bool = False,
 ) -> dict[str, Any]:
-    """Perform search with caching. Returns all matched results for client-side pagination."""
+    """Perform search with caching."""
     db = SessionLocal()
 
     filters = {}
@@ -407,7 +407,11 @@ def perform_search(
         if date_end:
             filters["date_range"]["end"] = date_end
 
+    if min_samples and min_samples > 0:
+        filters["min_samples"] = min_samples
+
     try:
+        # Perform search
         engine = HybridSearchEngine(db)
         results = engine.search(
             query=query,
@@ -1188,6 +1192,7 @@ def main() -> None:
 """,
         unsafe_allow_html=True,
     )
+    page = selected
 
     st.markdown(
         """
@@ -1332,6 +1337,7 @@ def main() -> None:
                     tech_type=tech_type if tech_type != "All" else None,
                     date_start=datetime.combine(date_start, datetime.min.time()) if date_start else None,
                     date_end=datetime.combine(date_end, datetime.max.time()) if date_end else None,
+                    min_samples=None,
                     use_semantic=use_semantic,
                     use_lexical=use_lexical,
                     use_mesh=use_mesh,
@@ -1388,7 +1394,8 @@ def main() -> None:
         metadata = results["metadata"]
         result_list = results["results"]
 
-        # Display search metadata — shown after pagination is computed below
+        # Display search metadata
+        st.caption(f"Found {metadata['total_results']} results")
 
         # Show MeSH expansion
         if saved_use_mesh and metadata.get("mesh_terms"):
@@ -1421,7 +1428,7 @@ def main() -> None:
             )
 
         if result_list:
-            PAGE_SIZE = 20
+            PAGE_SIZE = 10
             total = len(result_list)
             total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
 
@@ -1487,29 +1494,21 @@ def main() -> None:
             for result in result_list[start:end]:
                 render_result_card(result)
 
-            # Bottom pagination controls
-            bc1, bc2, bc3, bc4, bc5 = st.columns([1, 1, 4, 1, 1])
-            with bc1:
-                if st.button("« First", disabled=page <= 1, use_container_width=True, key="first_bot"):
-                    st.session_state.page = 1
-                    st.rerun()
-            with bc2:
-                if st.button("‹ Prev", disabled=page <= 1, use_container_width=True, key="prev_bot"):
+            # Pagination controls
+            col_prev, col_info, col_next = st.columns([1, 4, 1])
+            with col_prev:
+                if st.button("← Prev", disabled=page <= 1, use_container_width=True):
                     st.session_state.page -= 1
                     st.rerun()
-            with bc3:
+            with col_info:
                 st.markdown(
-                    f'<div style="text-align:center;font-size:0.85em;color:#666;padding-top:8px;">'
-                    f'Items {start+1}–{end} of {total}</div>',
+                    f'<div style="text-align:center;font-size:0.85em;color:#666;">'
+                    f'Showing {start+1}–{end} of {total}</div>',
                     unsafe_allow_html=True,
                 )
-            with bc4:
-                if st.button("Next ›", disabled=page >= total_pages, use_container_width=True, key="next_bot"):
+            with col_next:
+                if st.button("Next →", disabled=page >= total_pages, use_container_width=True):
                     st.session_state.page += 1
-                    st.rerun()
-            with bc5:
-                if st.button("Last »", disabled=page >= total_pages, use_container_width=True, key="last_bot"):
-                    st.session_state.page = total_pages
                     st.rerun()
         else:
             st.warning("No results found. Try adjusting your search query or filters.")
