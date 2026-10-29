@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from tqdm import tqdm
 
 from config import settings
-from db import IngestItem, IngestRun, get_db, init_db
+from db import IngestItem, IngestRun, SessionLocal, init_db
 from db.models import GSESeries
 
 from geo_ingest.ncbi_client import NCBIClient
@@ -163,6 +163,7 @@ class IngestionPipeline:
         self,
         accessions: list[str],
         skip_existing: bool = True,
+        progress_callback: Any = None,
     ) -> dict[str, Any]:
         """
         Ingest specific GSE accessions.
@@ -203,8 +204,9 @@ class IngestionPipeline:
             run.total_count = len(accessions) + skipped_count
             self.db.commit()
 
-            results = self._process_accessions(run.id, accessions)
+            results = self._process_accessions(run.id, accessions, progress_callback)
             results["skipped"] = skipped_count
+            results["total"] = len(accessions) + skipped_count
 
             run.end_time = datetime.now(timezone.utc)
             run.success_count = results["success"]
@@ -241,7 +243,7 @@ class IngestionPipeline:
         Returns:
             Statistics dictionary
         """
-        stats = {"success": 0, "errors": 0, "skipped": 0}
+        stats = {"success": 0, "errors": 0, "skipped": 0, "embed_errors": 0}
         total = len(accessions)
 
         # Collect parsed records for batch embedding
@@ -292,7 +294,6 @@ class IngestionPipeline:
                 self.db.merge(gse)
                 item.status = "completed"
                 item.process_time = datetime.now(timezone.utc)
-                # Single commit per record (not 7)
                 self.db.commit()
 
                 parsed_records.append((accession, parsed))
@@ -322,6 +323,11 @@ class IngestionPipeline:
                 logger.info(f"Upserted {len(pairs)} embeddings in one batch")
             except Exception as e:
                 logger.error(f"Batch embedding failed: {e}", exc_info=True)
+                stats["embed_errors"] = len(parsed_records)
+                logger.warning(
+                    f"{len(parsed_records)} records saved to DB but missing from vector store "
+                    "— they will not appear in semantic search results"
+                )
 
             # Auto-tag new records with MeSH terms
             if progress_callback:
@@ -329,7 +335,7 @@ class IngestionPipeline:
             try:
                 new_accessions = [acc for acc, _ in parsed_records]
                 matcher = MeSHMatcher(self.db)
-                n_associations = matcher.tag_gse_batch(new_accessions, confidence_threshold=0.3)
+                n_associations = matcher.tag_gse_batch(new_accessions, confidence_threshold=settings.mesh_confidence_threshold)
                 logger.info(f"Auto-tagged {len(new_accessions)} records with {n_associations} MeSH associations")
             except Exception as e:
                 # Non-fatal: MeSH terms may not be loaded yet
@@ -384,8 +390,7 @@ def main() -> int:
         return 0
 
     # Get database session
-    db_gen = get_db()
-    db = next(db_gen)
+    db = SessionLocal()
 
     try:
         pipeline = IngestionPipeline(db)

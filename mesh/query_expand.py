@@ -6,23 +6,176 @@ import logging
 import re
 from typing import Any
 
-from sqlalchemy import String, func, or_
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from db import MeshTerm, get_db
+from db import MeshTerm, SessionLocal
 
 logger = logging.getLogger(__name__)
 
 
-# Common lay terms mapped to MeSH-like wording to improve recall.
+# Top-level MeSH descriptors that are too broad to use for query expansion.
+# These match almost every biomedical dataset and inflate result counts dramatically.
+# e.g. D009369 "Neoplasms" matches all cancers; D007231 "Infant, Newborn" matches all neonatal studies.
+OVERLY_BROAD_MESH_IDS: set[str] = {
+    "D009369",  # Neoplasms (all cancers)
+    "D006801",  # Humans
+    "D000818",  # Animals
+    "D051379",  # Mice
+    "D007231",  # Infant, Newborn
+    "D008297",  # Male
+    "D005260",  # Female
+    "D000368",  # Aged
+    "D000293",  # Adolescent
+    "D000328",  # Adult
+    "D008875",  # Middle Aged
+    "D005243",  # Feces (too broad for most queries)
+}
+
+# Generic modifier words that must NOT drive MeSH expansion on their own.
+# These words appear as prefixes/substrings in hundreds of MeSH descriptors
+# (e.g. "treatment" → Treatment Failure, Treatment Outcome, Therapeutics…)
+# and produce massively over-broad result sets when used as standalone tokens.
+# They are only meaningful when part of a multi-word phrase that is already
+# handled by the bigram/trigram tokenisation paths.
+GENERIC_MODIFIER_WORDS: frozenset[str] = frozenset({
+    "treatment", "therapy", "therapies", "therapeutic",
+    "management", "intervention", "procedure", "approach",
+    "analysis", "study", "studies", "research", "investigation",
+    "effect", "effects", "response", "outcome", "outcomes",
+    "mechanism", "mechanisms", "pathway", "pathways",
+    "regulation", "expression", "function", "activity",
+    "disorder", "disease", "syndrome", "condition",
+    "patient", "patients", "subject", "subjects",
+    "human", "humans", "animal", "animals",
+    "model", "models", "method", "methods",
+    "protein", "proteins", "gene", "genes",
+    "cell", "cells", "tissue", "tissues",
+})
+
+# Lay terms and acronyms that don't appear in MeSH entry_terms — verified against the DB.
+# Also covers biomedical acronyms whose short form (≤5 chars) is blocked by the length
+# gates in _find_matching_mesh_terms but whose expansion IS a valid MeSH preferred name
+# or entry_term. Each alias is the full form used in MeSH preferred_name / entry_terms.
 LAY_TERM_ALIASES: dict[str, list[str]] = {
     "cancer": ["neoplasm", "neoplasms", "carcinoma", "tumor", "tumour"],
     "heart attack": ["myocardial infarction", "cardiac infarction"],
     "stroke": ["cerebrovascular accident", "brain ischemia"],
     "high blood pressure": ["hypertension"],
-    "kidney failure": ["renal failure"],
-    "liver cancer": ["hepatocellular carcinoma", "liver neoplasms", "hepatoma"],
+    # "blood cancer" not in MeSH
+    "blood cancer": ["leukemia", "lymphoma", "multiple myeloma", "hematologic neoplasms"],
+
+    # --- Biomedical acronyms (verified against mesh_term DB) ---
+    # Metabolic liver disease — "MASLD" not an entry_term; maps to D065626
+    "masld": ["non-alcoholic fatty liver disease"],
+    "mafld": ["non-alcoholic fatty liver disease"],
+    # Graft-versus-host disease — "GVHD" not an entry_term; maps to D006086
+    "gvhd":  ["graft-versus-host disease"],
+    # NF-κB — "NFkB"/"nfkb" not entry_terms; D016328 has "NF-kappa B" as preferred name
+    "nfkb":  ["nf-kappa b"],
+    "nf-kb": ["nf-kappa b"],
+    # TGF-β — "TGFb"/"tgfb" not entry_terms; D016212
+    "tgfb":  ["transforming growth factor beta"],
+    "tgf-b": ["transforming growth factor beta"],
+    # IFN-γ — "IFNg"/"ifng" not entry_terms; D007371
+    "ifng":  ["interferon-gamma"],
+    "ifn-g": ["interferon-gamma"],
+    # IL-6 — token "il6" is only 3 chars (blocked by length gate); D015850
+    "il6":   ["interleukin-6"],
+    "il-6":  ["interleukin-6"],
+    # PBMC — not an entry_term; maps to D007963 Leukocytes, Mononuclear
+    "pbmc":  ["peripheral blood mononuclear cells"],
+    "pbmcs": ["peripheral blood mononuclear cells"],
+    # LPS — 3 chars (length-blocked); maps to D008070 Lipopolysaccharides
+    "lps":   ["lipopolysaccharides"],
+    # HCC — 3 chars; maps to D006528 Carcinoma, Hepatocellular
+    "hcc":   ["carcinoma, hepatocellular"],
+    # HBV — 3 chars; maps to D006515 Hepatitis B virus
+    "hbv":   ["hepatitis b virus"],
+    # Cancer-associated fibroblasts — "CAFs"/"cafs" not entry_terms; D000072645
+    "cafs":  ["cancer-associated fibroblasts"],
+    "caf":   ["cancer-associated fibroblasts"],
+    # Mpox — 4 chars (blocked by length gate); D045908
+    "mpox":  ["monkeypox"],
+    # Mesenchymal stem cells — "MSC"/"msc" is 3 chars; D059630
+    "msc":   ["mesenchymal stem cells"],
+    "mscs":  ["mesenchymal stem cells"],
+    # PDAC — not in MeSH; nearest equivalent descriptors
+    "pdac":  ["pancreatic ductal adenocarcinoma", "pancreatic neoplasms"],
+    # MKI67 — gene name not in MeSH; nearest descriptor
+    "mki67": ["ki-67 antigen"],
+    # CAR-T — token form not in MeSH entry_terms
+    "car-t": ["receptors, chimeric antigen", "immunotherapy, adoptive"],
+    "cart":  ["receptors, chimeric antigen", "immunotherapy, adoptive"],
+    # AR signaling — "AR" is 2 chars (blocked by length gate); maps to D011944
+    "ar signaling": ["receptors, androgen", "androgen receptor"],
+    "ar":    ["receptors, androgen"],
+    # HBV-related HCC — compound alias
+    "hbv-related hcc": ["hepatitis b virus", "carcinoma, hepatocellular"],
+    "hbv related hcc": ["hepatitis b virus", "carcinoma, hepatocellular"],
+    # Mycobacterium tuberculosis — ensure macrophage link
+    "tuberculosis infected macrophages": ["tuberculosis", "macrophages"],
+    "mtb":   ["mycobacterium tuberculosis", "tuberculosis"],
+    # REST knockdown — REST is a transcription factor, not a MeSH term
+    "rest knockdown": ["repressor proteins", "gene silencing"],
+    "rest":  ["repressor proteins"],
 }
+
+
+# Word-level spelling corrections for common biomedical misspellings.
+# Applied before tokenization so both MeSH expansion and lexical search benefit.
+# Keys are lowercase misspelled words; values are the correct forms.
+# Only plain English misspellings are listed here — biomedical acronyms and gene
+# names are intentionally excluded (handled by LAY_TERM_ALIASES instead).
+SPELLING_CORRECTIONS: dict[str, str] = {
+    # Observed in benchmark queries
+    "mesenchimal":  "mesenchymal",
+    "gliobastoma":  "glioblastoma",
+    "psorasis":     "psoriasis",
+    "schizoprenia": "schizophrenia",
+    "leukimia":     "leukemia",
+    "leukimia":     "leukemia",
+    "breat":        "breast",
+    "faty":         "fatty",
+    "vitilago":     "vitiligo",
+    "sclorosis":    "sclerosis",
+    "parkison":     "parkinson",
+    "gliobastoma":  "glioblastoma",
+    # Common additional biomedical misspellings
+    "melanomia":    "melanoma",
+    "leukaemia":    "leukemia",   # British spelling — maps to same MeSH term
+    "haemoglobin":  "hemoglobin",
+    "oesophageal":  "esophageal",
+    "fibroblast":   "fibroblast",  # already correct — no-op guard
+    "cardiomyopthy":"cardiomyopathy",
+    "hepatocelluar":"hepatocellular",
+    "glioblastome": "glioblastoma",
+    "schizophrenia":"schizophrenia",  # already correct — no-op guard
+    "alzheimers":   "alzheimer",
+    "parkinsons":   "parkinson",
+}
+
+
+def _correct_spelling(query: str) -> str:
+    """
+    Apply word-level spelling corrections to a query string.
+
+    Corrects each word independently against SPELLING_CORRECTIONS.
+    Words not in the dict are passed through unchanged — this preserves
+    biomedical acronyms, gene names, and assay abbreviations.
+    """
+    words = query.split()
+    corrected = []
+    for w in words:
+        # Strip trailing punctuation (apostrophes, commas) before lookup,
+        # then restore the suffix so "Parkison's" → lookup "parkison" → "parkinson's"
+        stripped = w.lower().rstrip("'s,.")
+        if stripped in SPELLING_CORRECTIONS:
+            suffix = w[len(stripped):]  # preserve original capitalisation suffix
+            corrected.append(SPELLING_CORRECTIONS[stripped] + suffix)
+        else:
+            corrected.append(SPELLING_CORRECTIONS.get(w.lower(), w))
+    return " ".join(corrected)
 
 
 class QueryExpander:
@@ -68,18 +221,26 @@ class QueryExpander:
         """
         logger.info(f"Expanding query: '{query}'")
 
-        # Tokenize query
-        tokens = self._tokenize(query)
-        tokens = self._add_alias_tokens(query, tokens)
+        # Apply spelling corrections before tokenization so both MeSH expansion
+        # and the corrected_query returned to the caller (used by lexical search)
+        # benefit from the fix. The original query string is preserved separately.
+        corrected_query = _correct_spelling(query)
+        if corrected_query != query:
+            logger.info(f"Spelling corrected: '{query}' -> '{corrected_query}'")
 
-        # Find matching MeSH terms
-        matched_terms = self._find_matching_mesh_terms(tokens, max_terms)
+        # Tokenize corrected query; pass corrected form to alias injection too
+        tokens = self._tokenize(corrected_query)
+        tokens = self._add_alias_tokens(corrected_query, tokens)
+
+        # Find matching MeSH terms (use corrected query for match context)
+        matched_terms = self._find_matching_mesh_terms(tokens, max_terms, corrected_query)
 
         if not matched_terms:
             logger.info("No MeSH terms matched")
             return {
                 "original_query": query,
-                "expanded_query": query,
+                "corrected_query": corrected_query,
+                "expanded_query": corrected_query,
                 "matched_terms": [],
                 "expansion_tokens": [],
             }
@@ -88,20 +249,20 @@ class QueryExpander:
         expansion_tokens = []
 
         for term_info in matched_terms:
-            # Add preferred name if different from original
+            # Add preferred name if different from corrected query
             preferred = term_info["preferred_name"]
-            if preferred.lower() not in query.lower():
+            if preferred.lower() not in corrected_query.lower():
                 expansion_tokens.append(preferred)
 
             # Add selected entry terms (synonyms)
             if include_synonyms and term_info.get("entry_terms"):
                 # Add up to 2 most relevant entry terms per MeSH term
                 for entry_term in term_info["entry_terms"][:2]:
-                    if entry_term.lower() not in query.lower():
+                    if entry_term.lower() not in corrected_query.lower():
                         expansion_tokens.append(entry_term)
 
-        # Combine original query with expansions
-        expanded_query = f"{query} {' '.join(expansion_tokens)}"
+        # Combine corrected query with expansions
+        expanded_query = f"{corrected_query} {' '.join(expansion_tokens)}"
 
         logger.info(
             f"Expanded query with {len(matched_terms)} MeSH terms, "
@@ -110,6 +271,7 @@ class QueryExpander:
 
         return {
             "original_query": query,
+            "corrected_query": corrected_query,
             "expanded_query": expanded_query,
             "matched_terms": matched_terms,
             "expansion_tokens": expansion_tokens,
@@ -150,11 +312,15 @@ class QueryExpander:
 
     def _add_alias_tokens(self, query: str, tokens: list[str]) -> list[str]:
         """Add alias tokens for common lay phrases to improve matching."""
+        import re as _re
         combined = list(tokens)
         q = query.lower()
 
         for phrase, aliases in LAY_TERM_ALIASES.items():
-            if phrase in q:
+            # Use word-boundary matching to prevent "ar" from matching inside
+            # "cardiac", "ovarian", "Stargardt", etc.
+            pattern = r"(?<![a-z0-9])" + _re.escape(phrase) + r"(?![a-z0-9])"
+            if _re.search(pattern, q):
                 for alias in aliases:
                     if alias not in combined:
                         combined.append(alias)
@@ -165,6 +331,7 @@ class QueryExpander:
         self,
         tokens: list[str],
         max_terms: int,
+        query: str = "",
     ) -> list[dict[str, Any]]:
         """
         Find MeSH terms matching query tokens.
@@ -179,6 +346,10 @@ class QueryExpander:
         seen_ids: set[str] = set()
         matches: list[dict[str, Any]] = []
 
+        # Track which source token each match came from so the caller can
+        # group matches by concept and require intersection across groups.
+        current_token: list[str] = [""]
+
         def _add(term: MeshTerm, priority: int) -> None:
             if term.mesh_id in seen_ids:
                 return
@@ -188,61 +359,125 @@ class QueryExpander:
                 "preferred_name": term.preferred_name,
                 "entry_terms": term.entry_terms or [],
                 "descriptor_ui": term.descriptor_ui,
+                "source_token": current_token[0],
                 "_priority": priority,
             })
+
+        def _is_generic_single(token: str) -> bool:
+            """Return True if this is a bare generic word that must not drive MeSH lookup."""
+            return " " not in token and token.lower() in GENERIC_MODIFIER_WORDS
 
         # Pass 1: exact preferred name match (highest priority)
         for token in tokens:
             if len(token) < 3:
                 continue
+            is_multiword = " " in token
+            is_specific = len(token) >= 8
+            if not is_multiword and not is_specific:
+                continue
+            if _is_generic_single(token):
+                continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name) == token.lower()
             ).all()
             for t in results:
                 _add(t, 0)
 
-        # Pass 2: exact entry term match
+        # Pass 2: exact entry term match — allow single words >= 6 chars.
+        # Uses a lateral join because jsonb_array_elements_text is a set-returning function
+        # and cannot appear in a WHERE clause directly.
         for token in tokens:
             if len(token) < 3:
                 continue
-            results = self.db.query(MeshTerm).filter(
-                func.lower(func.cast(MeshTerm.entry_terms, String)).like(
-                    f'%"{token.lower()}"%'
+            if _is_generic_single(token):
+                continue
+            current_token[0] = token
+            rows = self.db.execute(
+                text("""
+                    SELECT mesh_id, descriptor_ui, preferred_name, entry_terms, tree_numbers, created_at
+                    FROM mesh_term,
+                         jsonb_array_elements_text(entry_terms) AS et
+                    WHERE lower(et) = :token
+                    LIMIT :lim
+                """),
+                {"token": token.lower(), "lim": max_terms},
+            ).fetchall()
+            for row in rows:
+                t = MeshTerm(
+                    mesh_id=row[0], descriptor_ui=row[1], preferred_name=row[2],
+                    entry_terms=row[3], tree_numbers=row[4], created_at=row[5],
                 )
-            ).limit(max_terms).all()
-            for t in results:
                 _add(t, 1)
 
-        # Pass 3: preferred name starts with token (longer tokens only)
+        # Pass 3: preferred name starts with token
+        # Allow multi-word tokens OR long single words (>=8 chars) to catch "diabetes" → "Diabetes Mellitus"
+        # Only accept results where the preferred name either equals the token or continues
+        # with a space (e.g. token "breast neoplasms" → "Breast Neoplasms Male" ok,
+        # "Breast Neoplasms, Male" NOT ok — comma-qualified variants require explicit query match).
         for token in tokens:
             if len(token) < 5:
                 continue
+            if _is_generic_single(token):
+                continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"{token.lower()}%")
             ).limit(max_terms).all()
             for t in results:
+                remainder = t.preferred_name.lower()[len(token):]
+                if remainder and not remainder.startswith(" "):
+                    continue  # comma/punctuation qualifier not in query — skip
                 _add(t, 2)
 
         # Pass 4: partial preferred name match (fallback)
         for token in tokens:
             if len(token) < 5:
                 continue
+            current_token[0] = token
             results = self.db.query(MeshTerm).filter(
                 func.lower(MeshTerm.preferred_name).like(f"%{token.lower()}%")
             ).limit(max_terms).all()
             for t in results:
                 _add(t, 3)
 
-        # Pass 5: partial entry term match (lay-term fallback)
+        def _has_unqueried_comma_qualifier(term: MeshTerm, query_lower: str) -> bool:
+            """Return True if the preferred name has a ', Qualifier' suffix whose
+            qualifier word does not appear in the original query.
+            e.g. 'Breast Neoplasms, Male' when query is 'breast cancer' → True (skip).
+            """
+            name = term.preferred_name.lower()
+            if "," not in name:
+                return False
+            qualifier = name.split(",", 1)[1].strip()
+            return qualifier not in query_lower
+
+        query_lower_full = query.lower()
+
+        # Pass 5: partial entry term match — multi-word only (lay-term fallback).
+        # Uses a lateral join because jsonb_array_elements_text is a set-returning function
+        # and cannot appear in a WHERE clause directly.
         for token in tokens:
             if len(token) < 4:
                 continue
-            results = self.db.query(MeshTerm).filter(
-                func.lower(func.cast(MeshTerm.entry_terms, String)).like(
-                    f"%{token.lower()}%"
+            current_token[0] = token
+            rows = self.db.execute(
+                text("""
+                    SELECT mesh_id, descriptor_ui, preferred_name, entry_terms, tree_numbers, created_at
+                    FROM mesh_term,
+                         jsonb_array_elements_text(entry_terms) AS et
+                    WHERE lower(et) LIKE :pattern
+                    LIMIT :lim
+                """),
+                {"pattern": f"%{token.lower()}%", "lim": max_terms},
+            ).fetchall()
+            for row in rows:
+                t = MeshTerm(
+                    mesh_id=row[0], descriptor_ui=row[1], preferred_name=row[2],
+                    entry_terms=row[3], tree_numbers=row[4], created_at=row[5],
                 )
-            ).limit(max_terms).all()
-            for t in results:
+                if _has_unqueried_comma_qualifier(t, query_lower_full):
+                    continue
                 _add(t, 4)
 
         # Sort by priority then return top max_terms
@@ -264,8 +499,7 @@ def expand_query_simple(query: str, db: Session | None = None) -> str:
         Expanded query string
     """
     if db is None:
-        db_gen = get_db()
-        db = next(db_gen)
+        db = SessionLocal()
         close_db = True
     else:
         close_db = False

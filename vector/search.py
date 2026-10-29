@@ -2,6 +2,8 @@
 import logging
 from typing import Any
 
+import numpy as np
+
 from vector.embeddings import EmbeddingProvider, get_embedding_provider
 from vector.milvus_store import MilvusStore
 
@@ -30,30 +32,43 @@ def _get_vector_store() -> MilvusStore:
 
 def semantic_search(
     query: str,
-    top_k: int = 100,
+    top_k: int = 500,
     filter_expr: str | None = None,
-    min_score: float = 0.65,
+    min_score: float = 0.45,
+    expanded_query: str | None = None,
+    query_weight: float = 0.7,
 ) -> list[dict[str, Any]]:
     """
     Perform semantic search over GEO datasets.
 
     Args:
-        query: Search query text
+        query: Original user query (always embedded)
         top_k: Number of results to return
         filter_expr: Optional Milvus filter expression
+        min_score: Minimum cosine similarity threshold
+        expanded_query: MeSH-expanded query text (embedded separately and blended)
+        query_weight: Weight for original query vector (1 - query_weight goes to expanded)
 
-    Returns:
-        List of search results with accession and score
-
-    Example:
-        >>> results = semantic_search("breast cancer RNA-seq", top_k=50)
-        >>> for result in results:
-        ...     print(f"{result['accession']}: {result['score']:.3f}")
+    When expanded_query is provided the final search vector is a weighted average:
+        v_final = query_weight * v_query + (1 - query_weight) * v_expanded
+    This prevents long MeSH synonym lists from diluting the original query intent.
     """
-    logger.info(f"Semantic search: query='{query}', top_k={top_k}")
+    logger.info(f"Semantic search: query='{query}', top_k={top_k}, expanded={bool(expanded_query)}")
 
     embedding_provider = _get_embedding_provider()
-    query_embedding = embedding_provider.embed_texts([query])[0]
+
+    if expanded_query and expanded_query.strip() != query.strip():
+        # Embed original and expanded separately, then weighted-average
+        vectors = embedding_provider.embed_texts([query, expanded_query])
+        v_query = np.array(vectors[0], dtype=np.float32)
+        v_expanded = np.array(vectors[1], dtype=np.float32)
+        blended = query_weight * v_query + (1.0 - query_weight) * v_expanded
+        # Re-normalise so cosine similarity (inner product on unit vectors) stays valid
+        norm = np.linalg.norm(blended)
+        query_embedding = (blended / norm).tolist() if norm > 0 else blended.tolist()
+        logger.info(f"Blended query vector: {query_weight:.0%} original + {1-query_weight:.0%} expanded")
+    else:
+        query_embedding = embedding_provider.embed_texts([query])[0]
 
     vector_store = _get_vector_store()
     results = vector_store.search(
@@ -63,7 +78,6 @@ def semantic_search(
     )
 
     # Filter out low-confidence semantic matches to avoid inflating result counts.
-    # Scores below min_score are loosely related by topic but not specific enough.
     if min_score > 0:
         results = [r for r in results if r["score"] >= min_score]
 

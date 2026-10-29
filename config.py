@@ -38,25 +38,47 @@ class Settings(BaseSettings):
     rate_limit_qps: float = 3.0  # Queries per second
 
     # Embeddings
-    embedding_provider: Literal["local", "openai"] = "local"
-    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
-    embedding_dimension: int = 768
+    embedding_provider: Literal["local", "openai", "azure_openai"] = "azure_openai"
+    embedding_model: str = "text-embedding-3-large"
+    embedding_dimension: int = 3072
 
     # OpenAI
     openai_api_key: str | None = None
-    openai_embedding_model: str = "text-embedding-3-small"
+    openai_embedding_model: str = "text-embedding-3-large"
+
+    # Azure OpenAI
+    azure_openai_api_key: str | None = None
+    azure_openai_endpoint: str | None = None
+    azure_openai_api_version: str = "2024-02-01"
+    azure_openai_deployment: str | None = None
 
     # LLM Q&A
-    llm_provider: str = "auto"           # "auto" | "ollama" | "openai" | "none"
+    llm_provider: str = "auto"           # "auto" | "openai" | "azure_openai" | "none"
     llm_model: str | None = None         # override model name per provider
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3"         # model tag pulled in Ollama
+    ollama_base_url: str = "http://localhost:11434"  # unused — Ollama not in stack
+    ollama_model: str = "llama3"                     # unused — Ollama not in stack
 
     # Search
-    semantic_top_k: int = 100
+    semantic_top_k: int = 1000  # Milvus candidates — raised to 1000 so high-volume queries
+                                 # (e.g. NFkB activation, triple-negative breast cancer) surface
+                                 # relevant datasets beyond the former 500-candidate ceiling.
+                                 # The adaptive threshold cascade (0.65→0.45) still controls
+                                 # which candidates enter RRF, so ranking quality is preserved.
     lexical_top_k: int = 100
-    final_top_k: int = 50
+    final_top_k: int = 750
     rrf_k: int = 60  # Reciprocal Rank Fusion constant
+
+    # Rewriter (pre-retrieval LLM query understanding)
+    rewrite_enabled: bool = False        # set REWRITE_ENABLED=true to activate
+    rewrite_effort: str = "none"         # LLM reasoning effort: none|low|medium
+
+    # Judge (post-retrieval LLM relevance filter)
+    judge_enabled: bool = False          # set JUDGE_ENABLED=true to activate
+    judge_top_k: int = 150               # how many results to send to the judge
+    judge_effort: str = "none"           # LLM reasoning effort: none|low|medium
+
+    # MeSH tagging
+    mesh_confidence_threshold: float = 0.3
 
     # Logging
     log_level: str = "INFO"

@@ -10,6 +10,8 @@ Tabs:
   7. Performance Latency
 """
 import time
+from collections import Counter
+
 import streamlit as st
 import pandas as pd
 from sqlalchemy import text
@@ -322,7 +324,7 @@ def _section_search_benchmark():
                 with SessionLocal() as db:
                     engine  = HybridSearchEngine(db)
                     t0      = time.time()
-                    res     = engine.search(query=query, top_k=10000)
+                    res     = engine.search(query=query)
                     elapsed = round((time.time() - t0) * 1000)
                 geo_count = res.get("total", len(res.get("results", [])))
             except Exception as e:
@@ -403,7 +405,6 @@ def _section_pipeline_comparison():
                     t0 = time.time()
                     res = engine.search(
                         query=query,
-                        top_k=5000,
                         use_semantic=cfg["semantic"],
                         use_lexical=cfg["lexical"],
                         use_mesh=cfg["mesh"],
@@ -485,7 +486,7 @@ def _section_performance():
             try:
                 with SessionLocal() as db:
                     engine = HybridSearchEngine(db)
-                    res = engine.search(query=query, top_k=100)
+                    res = engine.search(query=query)
                 total_results = res.get("total", 0)
             except Exception as e:
                 total_results = 0
@@ -496,7 +497,7 @@ def _section_performance():
             try:
                 with SessionLocal() as db:
                     engine = HybridSearchEngine(db)
-                    engine.search(query=query, top_k=100, use_semantic=True, use_lexical=False, use_mesh=False)
+                    engine.search(query=query, use_semantic=True, use_lexical=False, use_mesh=False)
             except Exception:
                 pass
             latencies["Semantic Only"] = round((time.time() - t0) * 1000)
@@ -506,7 +507,7 @@ def _section_performance():
             try:
                 with SessionLocal() as db:
                     engine = HybridSearchEngine(db)
-                    engine.search(query=query, top_k=100, use_semantic=False, use_lexical=True, use_mesh=False)
+                    engine.search(query=query, use_semantic=False, use_lexical=True, use_mesh=False)
             except Exception:
                 pass
             latencies["Lexical Only"] = round((time.time() - t0) * 1000)
@@ -530,13 +531,608 @@ def _section_performance():
         st.info("Enter a query and click **▶ Profile Query**.")
 
 
+# ── Section 8: IR Evaluation — P@10 and MRR ───────────────────────────────────
+
+# 50 curated queries with relevance signals drawn from MeSH tags.
+# Each entry: query text + list of expected MeSH preferred names that a
+# relevant result should be tagged with (at least one must match for a result
+# to count as relevant). This lets us compute relevance without manual
+# annotation: a dataset tagged with the correct disease MeSH term is
+# considered relevant.
+IR_EVAL_QUERIES: list[dict] = [
+    # Oncology (10)
+    {"query": "breast cancer RNA-seq",           "relevant_mesh": ["Breast Neoplasms"]},
+    {"query": "lung cancer gene expression",     "relevant_mesh": ["Lung Neoplasms"]},
+    {"query": "pancreatic cancer transcriptome", "relevant_mesh": ["Pancreatic Neoplasms"]},
+    {"query": "colorectal cancer methylation",   "relevant_mesh": ["Colorectal Neoplasms"]},
+    {"query": "prostate cancer single cell",     "relevant_mesh": ["Prostatic Neoplasms"]},
+    {"query": "ovarian cancer RNA sequencing",   "relevant_mesh": ["Ovarian Neoplasms"]},
+    {"query": "liver cancer hepatocellular",     "relevant_mesh": ["Carcinoma, Hepatocellular"]},
+    {"query": "glioblastoma brain tumor",        "relevant_mesh": ["Glioblastoma"]},
+    {"query": "leukemia ALL childhood",          "relevant_mesh": ["Precursor Cell Lymphoblastic Leukemia-Lymphoma"]},
+    {"query": "melanoma immunotherapy",          "relevant_mesh": ["Melanoma"]},
+    # Neurological (8)
+    {"query": "Alzheimer's disease brain",       "relevant_mesh": ["Alzheimer Disease"]},
+    {"query": "Parkinson's disease dopamine",    "relevant_mesh": ["Parkinson Disease"]},
+    {"query": "multiple sclerosis neuroinflammation", "relevant_mesh": ["Multiple Sclerosis"]},
+    {"query": "epilepsy seizure gene",           "relevant_mesh": ["Epilepsy"]},
+    {"query": "autism spectrum disorder",        "relevant_mesh": ["Autistic Disorder"]},
+    {"query": "schizophrenia prefrontal cortex", "relevant_mesh": ["Schizophrenia"]},
+    {"query": "stroke ischemia brain",           "relevant_mesh": ["Stroke"]},
+    {"query": "ALS motor neuron disease",        "relevant_mesh": ["Amyotrophic Lateral Sclerosis"]},
+    # Metabolic / Cardiovascular (8)
+    {"query": "type 2 diabetes insulin resistance", "relevant_mesh": ["Diabetes Mellitus, Type 2"]},
+    {"query": "obesity adipose tissue",          "relevant_mesh": ["Obesity"]},
+    {"query": "heart failure cardiac",           "relevant_mesh": ["Heart Failure"]},
+    {"query": "atherosclerosis coronary artery", "relevant_mesh": ["Atherosclerosis"]},
+    {"query": "myocardial infarction heart attack", "relevant_mesh": ["Myocardial Infarction"]},
+    {"query": "hypertension blood pressure",     "relevant_mesh": ["Hypertension"]},
+    {"query": "non-alcoholic fatty liver NASH",  "relevant_mesh": ["Non-alcoholic Fatty Liver Disease"]},
+    {"query": "kidney disease renal fibrosis",   "relevant_mesh": ["Renal Insufficiency, Chronic"]},
+    # Infectious / Immune (8)
+    {"query": "COVID-19 SARS-CoV-2",            "relevant_mesh": ["COVID-19"]},
+    {"query": "HIV AIDS immune",                 "relevant_mesh": ["HIV Infections"]},
+    {"query": "tuberculosis mycobacterium",      "relevant_mesh": ["Tuberculosis"]},
+    {"query": "influenza virus infection",       "relevant_mesh": ["Influenza, Human"]},
+    {"query": "sepsis inflammatory response",    "relevant_mesh": ["Sepsis"]},
+    {"query": "lupus autoimmune SLE",            "relevant_mesh": ["Lupus Erythematosus, Systemic"]},
+    {"query": "rheumatoid arthritis joint",      "relevant_mesh": ["Arthritis, Rheumatoid"]},
+    {"query": "malaria plasmodium",              "relevant_mesh": ["Malaria"]},
+    # Rare / Niche (8)
+    {"query": "vitiligo melanocyte",             "relevant_mesh": ["Vitiligo"]},
+    {"query": "cystic fibrosis CFTR",            "relevant_mesh": ["Cystic Fibrosis"]},
+    {"query": "Huntington's disease neurodegeneration", "relevant_mesh": ["Huntington Disease"]},
+    {"query": "sickle cell disease hemoglobin", "relevant_mesh": ["Anemia, Sickle Cell"]},
+    {"query": "muscular dystrophy DMD",          "relevant_mesh": ["Muscular Dystrophies"]},
+    {"query": "Niemann-Pick sphingolipid",       "relevant_mesh": ["Niemann-Pick Diseases"]},
+    {"query": "Gaucher disease glucocerebrosidase", "relevant_mesh": ["Gaucher Disease"]},
+    {"query": "phenylketonuria PKU metabolism",  "relevant_mesh": ["Phenylketonurias"]},
+    # Technology / Cross-cutting (8)
+    {"query": "single-cell RNA-seq scRNA",       "relevant_mesh": ["Single-Cell Analysis"]},
+    {"query": "ATAC-seq chromatin accessibility","relevant_mesh": ["Chromatin"]},
+    {"query": "ChIP-seq histone modification",   "relevant_mesh": ["Histones"]},
+    {"query": "CRISPR gene editing",             "relevant_mesh": ["CRISPR-Cas Systems"]},
+    {"query": "spatial transcriptomics tissue",  "relevant_mesh": ["Transcriptome"]},
+    {"query": "proteomics mass spectrometry",    "relevant_mesh": ["Proteomics"]},
+    {"query": "microbiome gut 16S",              "relevant_mesh": ["Microbiota"]},
+    {"query": "DNA methylation epigenome WGBS",  "relevant_mesh": ["DNA Methylation"]},
+]
+
+
+def _evaluate_query_ir(
+    query: str,
+    relevant_mesh: list[str],
+    engine,
+    db_session,
+    k: int = 10,
+    use_semantic: bool = True,
+    use_lexical: bool = True,
+    use_mesh: bool = True,
+) -> dict:
+    """Run a single query, return P@k and first-relevant rank."""
+    from sqlalchemy import text as _text
+
+    t0 = time.time()
+    res = engine.search(
+        query=query,
+        use_semantic=use_semantic,
+        use_lexical=use_lexical,
+        use_mesh=use_mesh,
+    )
+    elapsed = round((time.time() - t0) * 1000)
+
+    results = res.get("results", [])[:k]
+    if not results:
+        return {"P@10": 0.0, "RR": 0.0, "latency_ms": elapsed, "n_results": 0}
+
+    # For each result, check whether it has at least one relevant MeSH tag
+    accessions = [r["accession"] for r in results]
+    relevant_set = set(m.lower() for m in relevant_mesh)
+
+    # Batch query: which accessions have a relevant MeSH tag?
+    placeholders = ", ".join(f":acc_{i}" for i in range(len(accessions)))
+    params = {f"acc_{i}": acc for i, acc in enumerate(accessions)}
+    sql = f"""
+        SELECT DISTINCT gm.accession
+        FROM gse_mesh gm
+        JOIN mesh_term mt ON gm.mesh_id = mt.mesh_id
+        WHERE gm.accession IN ({placeholders})
+          AND LOWER(mt.preferred_name) = ANY(:mesh_names)
+    """
+    params["mesh_names"] = list(relevant_set)
+    tagged = set(
+        row[0] for row in db_session.execute(_text(sql), params).fetchall()
+    )
+
+    # Compute P@k and RR
+    hits = [1 if acc in tagged else 0 for acc in accessions]
+    p_at_k = sum(hits) / k
+    rr = 0.0
+    for rank, h in enumerate(hits, start=1):
+        if h == 1:
+            rr = 1.0 / rank
+            break
+
+    return {"P@10": round(p_at_k, 3), "RR": round(rr, 3), "latency_ms": elapsed, "n_results": len(results)}
+
+
+def _section_ir_evaluation():
+    st.subheader("IR Evaluation — P@10 and MRR")
+    st.caption(
+        "Evaluates retrieval quality using MeSH-tag relevance as a proxy for relevance labels. "
+        "A result is considered **relevant** if it is tagged with at least one of the expected MeSH terms "
+        "for that query (e.g., a 'breast cancer' query is relevant if the dataset has 'Breast Neoplasms' tag). "
+        "Computes **P@10** (fraction of top-10 results that are relevant) and "
+        "**MRR** (Mean Reciprocal Rank — position of first relevant result)."
+    )
+
+    with st.expander("Query Set (50 queries across 5 domains)", expanded=False):
+        df_queries = pd.DataFrame([
+            {"Query": q["query"], "Expected MeSH": ", ".join(q["relevant_mesh"])}
+            for q in IR_EVAL_QUERIES
+        ])
+        st.dataframe(df_queries, use_container_width=True, hide_index=True)
+
+    col1, col2, col3 = st.columns([1, 1, 2])
+    run_eval = col1.button("▶ Run Full Evaluation (50 queries)", key="run_ir_eval")
+    run_sample = col2.button("▶ Quick Sample (10 queries)", key="run_ir_sample")
+    k_val = col3.slider("k (Precision@k)", min_value=5, max_value=20, value=10, step=5, key="ir_k")
+
+    queries_to_run = None
+    if run_eval:
+        queries_to_run = IR_EVAL_QUERIES
+    elif run_sample:
+        # Pick 2 from each domain block
+        queries_to_run = IR_EVAL_QUERIES[::5]  # every 5th → 10 queries spread across domains
+
+    if queries_to_run:
+        from search import HybridSearchEngine
+
+        results = []
+        progress = st.progress(0)
+        status = st.empty()
+        n = len(queries_to_run)
+
+        for i, q_entry in enumerate(queries_to_run):
+            status.text(f"[{i+1}/{n}] {q_entry['query']}")
+            try:
+                with SessionLocal() as db:
+                    engine = HybridSearchEngine(db)
+                    metrics = _evaluate_query_ir(
+                        q_entry["query"], q_entry["relevant_mesh"], engine, db, k=k_val
+                    )
+                results.append({
+                    "Query": q_entry["query"],
+                    "Expected MeSH": q_entry["relevant_mesh"][0],
+                    f"P@{k_val}": metrics["P@10"],
+                    "RR": metrics["RR"],
+                    "Latency (ms)": metrics["latency_ms"],
+                    "Results": metrics["n_results"],
+                })
+            except Exception as e:
+                st.error(f"Query '{q_entry['query']}' failed: {type(e).__name__}: {e}")
+                results.append({
+                    "Query": q_entry["query"],
+                    "Expected MeSH": q_entry["relevant_mesh"][0],
+                    f"P@{k_val}": "Error",
+                    "RR": "Error",
+                    "Latency (ms)": None,
+                    "Results": 0,
+                })
+            progress.progress((i + 1) / n)
+
+        status.empty()
+        progress.empty()
+
+        # Summary metrics
+        valid = [r for r in results if isinstance(r[f"P@{k_val}"], float)]
+        if valid:
+            mean_p = sum(r[f"P@{k_val}"] for r in valid) / len(valid)
+            mean_mrr = sum(r["RR"] for r in valid) / len(valid)
+            avg_lat = sum(r["Latency (ms)"] for r in valid if r["Latency (ms)"]) / len(valid)
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric(f"Mean P@{k_val}", f"{mean_p:.3f}")
+            mc2.metric("MRR", f"{mean_mrr:.3f}")
+            mc3.metric("Queries Evaluated", len(valid))
+            mc4.metric("Avg Latency (ms)", f"{avg_lat:.0f}")
+
+            st.info(
+                f"**GEOSearch (this run):** P@{k_val} = {mean_p:.3f} · MRR = {mean_mrr:.3f}"
+            )
+
+        df_res = pd.DataFrame(results)
+        st.dataframe(df_res, use_container_width=True, hide_index=True)
+
+        # P@k bar chart
+        if valid:
+            chart_df = pd.DataFrame({
+                "Query": [r["Query"][:40] for r in valid],
+                f"P@{k_val}": [r[f"P@{k_val}"] for r in valid],
+                "RR": [r["RR"] for r in valid],
+            }).set_index("Query")
+            st.bar_chart(chart_df)
+    else:
+        st.info(
+            "Click **▶ Run Full Evaluation** to score all 50 queries, "
+            "or **▶ Quick Sample** for a 10-query preview."
+        )
+
+
+# ── Section 9: K-Means Clustering + PCA ───────────────────────────────────────
+
+def _section_kmeans_clustering():
+    st.subheader("K-Means Topic Clustering + PCA Visualization")
+    st.caption(
+        "Fetches dataset embeddings from Milvus, runs K-Means clustering (k = user-selected), "
+        "reduces to 2D via PCA, and labels each cluster with top TF-IDF n-grams from member titles. "
+        "Clusters GEO datasets by embedding similarity on the Human Cancer subset."
+    )
+
+    # Controls
+    c1, c2, c3, c4 = st.columns(4)
+    k_clusters = c1.slider("Number of clusters (k)", 3, 20, 8, key="km_k")
+    subset_org  = c2.selectbox("Organism filter", ["Homo sapiens", "Mus musculus", "All"], key="km_org")
+    subset_tech = c3.selectbox("Tech type filter", ["All", "Expression profiling by high throughput sequencing",
+                                                     "Expression profiling by array",
+                                                     "Methylation profiling by high throughput sequencing",
+                                                     "Single-cell RNA sequencing"], key="km_tech")
+    max_records = c4.number_input("Max records to cluster", 500, 20000, 5000, 500, key="km_max")
+
+    run_cluster = st.button("▶ Run K-Means Clustering", key="run_kmeans", type="primary")
+
+    if not run_cluster:
+        st.info(
+            "Select filters and k, then click **▶ Run K-Means Clustering**. "
+            "Embeddings are fetched from Milvus — this may take 10–30 seconds for large subsets."
+        )
+        return
+
+    # ── 1. Fetch accessions + metadata from PostgreSQL ─────────────────────────
+    status = st.empty()
+    status.text("Fetching dataset metadata from PostgreSQL...")
+
+    org_filter = "" if subset_org == "All" else f"AND organism_text ILIKE '%{subset_org}%'"
+    tech_filter = "" if subset_tech == "All" else f"AND tech_type = :tech_type"
+    sql = f"""
+        SELECT accession, title, tech_type, organism_text
+        FROM gse_series
+        WHERE accession IS NOT NULL
+          AND title IS NOT NULL
+          {org_filter}
+          {tech_filter}
+        ORDER BY submission_date DESC NULLS LAST
+        LIMIT :lim
+    """
+    params: dict = {"lim": int(max_records)}
+    if subset_tech != "All":
+        params["tech_type"] = subset_tech
+
+    rows = _run(sql, params)
+    if not rows:
+        st.warning("No records match the selected filters.")
+        return
+
+    accessions = [r["accession"] for r in rows]
+    titles     = [r["title"] or "" for r in rows]
+    tech_types = [r["tech_type"] or "unknown" for r in rows]
+    status.text(f"Fetched {len(accessions)} records. Loading embeddings from Milvus...")
+
+    # ── 2. Fetch embeddings from Milvus ────────────────────────────────────────
+    try:
+        from vector.milvus_store import MilvusStore
+        import numpy as np
+        store = MilvusStore()
+
+        # Milvus query by accession — batch in chunks of 1000
+        embeddings_map: dict[str, list[float]] = {}
+        chunk_size = 1000
+        for i in range(0, len(accessions), chunk_size):
+            chunk = accessions[i:i + chunk_size]
+            quoted = ", ".join(f'"{a}"' for a in chunk)
+            hits = store.collection.query(
+                expr=f"accession in [{quoted}]",
+                output_fields=["accession", "embedding"],
+                limit=chunk_size,
+            )
+            for h in hits:
+                embeddings_map[h["accession"]] = h["embedding"]
+            status.text(f"Loaded {len(embeddings_map)}/{len(accessions)} embeddings...")
+
+        # Filter to records that have embeddings
+        paired = [(a, t, tt, embeddings_map[a]) for a, t, tt in zip(accessions, titles, tech_types) if a in embeddings_map]
+        if len(paired) < k_clusters:
+            st.warning(f"Only {len(paired)} records have embeddings — need at least k={k_clusters}.")
+            return
+
+        acc_list   = [p[0] for p in paired]
+        title_list = [p[1] for p in paired]
+        tech_list  = [p[2] for p in paired]
+        X = np.array([p[3] for p in paired], dtype=np.float32)
+
+    except Exception as e:
+        st.error(f"Could not load embeddings from Milvus: {e}")
+        st.info("Ensure Milvus is running and embeddings have been generated (run backfill or ingest).")
+        return
+
+    status.text(f"Running K-Means (k={k_clusters}) on {X.shape[0]} × {X.shape[1]} embeddings...")
+
+    # ── 3. K-Means ─────────────────────────────────────────────────────────────
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import normalize
+    from sklearn.decomposition import PCA
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    import numpy as np
+
+    X_norm = normalize(X, norm="l2")  # cosine ≈ euclidean after L2 norm
+    km = KMeans(n_clusters=k_clusters, init="k-means++", n_init=10, random_state=42)
+    labels = km.fit_predict(X_norm)
+
+    # ── 4. TF-IDF cluster labels ───────────────────────────────────────────────
+    status.text("Generating TF-IDF cluster labels...")
+    tfidf = TfidfVectorizer(
+        ngram_range=(1, 2),
+        stop_words="english",
+        max_features=10000,
+        min_df=2,
+    )
+    tfidf.fit(title_list)
+    feature_names = tfidf.get_feature_names_out()
+
+    cluster_labels: dict[int, str] = {}
+    cluster_sizes: dict[int, int] = {}
+    for c in range(k_clusters):
+        member_titles = [title_list[i] for i, lbl in enumerate(labels) if lbl == c]
+        cluster_sizes[c] = len(member_titles)
+        if not member_titles:
+            cluster_labels[c] = f"Cluster {c}"
+            continue
+        tfidf_matrix = tfidf.transform(member_titles)
+        mean_scores = tfidf_matrix.mean(axis=0).A1
+        top_idx = mean_scores.argsort()[::-1][:3]
+        top_terms = [feature_names[i] for i in top_idx]
+        cluster_labels[c] = f"C{c}: {' · '.join(top_terms)}"
+
+    # ── 5. PCA 2D ──────────────────────────────────────────────────────────────
+    status.text("Reducing to 2D with PCA...")
+    pca = PCA(n_components=2, random_state=42)
+    X_2d = pca.fit_transform(X_norm)
+    var_explained = pca.explained_variance_ratio_ * 100
+
+    # ── 6. Build scatter dataframe ────────────────────────────────────────────
+    import plotly.express as px
+
+    df_plot = pd.DataFrame({
+        "PC1":      X_2d[:, 0],
+        "PC2":      X_2d[:, 1],
+        "Cluster":  [cluster_labels[lbl] for lbl in labels],
+        "Accession": acc_list,
+        "Title":    [t[:80] for t in title_list],
+        "Tech Type": tech_list,
+    })
+
+    status.empty()
+
+    # ── 7. Render ──────────────────────────────────────────────────────────────
+    # Cluster summary table
+    st.subheader("Cluster Summary")
+    summary_rows = []
+    for c in range(k_clusters):
+        member_tech = [tech_list[i] for i, lbl in enumerate(labels) if lbl == c]
+        top_tech = Counter(member_tech).most_common(1)
+        summary_rows.append({
+            "Cluster": cluster_labels[c],
+            "Size": cluster_sizes[c],
+            "Dominant Tech Type": top_tech[0][0] if top_tech else "—",
+        })
+    st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    # PCA scatter
+    st.subheader(f"PCA 2D Scatter — {len(acc_list):,} datasets · k={k_clusters}")
+    st.caption(
+        f"PC1 explains {var_explained[0]:.1f}% variance, PC2 explains {var_explained[1]:.1f}% "
+        f"(total {var_explained.sum():.1f}%). Each point is one GSE dataset."
+    )
+    fig = px.scatter(
+        df_plot,
+        x="PC1", y="PC2",
+        color="Cluster",
+        hover_data={"Accession": True, "Title": True, "Tech Type": True, "PC1": False, "PC2": False},
+        title=f"K-Means (k={k_clusters}) on {len(acc_list):,} GEO embeddings",
+        height=600,
+        opacity=0.7,
+    )
+    fig.update_traces(marker=dict(size=4))
+    fig.update_layout(legend=dict(orientation="v", x=1.01, y=1))
+    st.plotly_chart(fig, use_container_width=True)
+
+    # WCSS / inertia
+    st.metric("K-Means Inertia (WCSS)", f"{km.inertia_:,.0f}")
+    st.caption(
+        "Lower inertia = tighter clusters. Run with different k values to find the elbow. "
+        "Lower inertia = tighter clusters. Run with different k values to find the elbow."
+    )
+
+    # Elbow plot option
+    if st.checkbox("Show elbow curve (k = 2–15, slow)", key="km_elbow"):
+        st.info("Computing K-Means for k=2..15 — this may take 1-2 minutes...")
+        inertias = []
+        ks = list(range(2, 16))
+        elbow_prog = st.progress(0)
+        for i, ki in enumerate(ks):
+            ki_model = KMeans(n_clusters=ki, init="k-means++", n_init=5, random_state=42)
+            ki_model.fit(X_norm)
+            inertias.append(ki_model.inertia_)
+            elbow_prog.progress((i + 1) / len(ks))
+        elbow_prog.empty()
+        elbow_df = pd.DataFrame({"k": ks, "WCSS (Inertia)": inertias}).set_index("k")
+        st.line_chart(elbow_df)
+        st.caption("Choose k at the 'elbow' — where adding more clusters gives diminishing inertia reduction.")
+
+
+# ── Section 10: Formal Ablation — Table 4.2 style ────────────────────────────
+
+def _section_formal_ablation():
+    st.subheader("Formal Ablation Study")
+    st.caption(
+        "Systematic comparison of retrieval configurations: semantic-only, lexical-only, "
+        "hybrid without MeSH, and full hybrid. Evaluates using P@10 / MRR on the 50-query benchmark above "
+        "(or a custom query set). **This produces a publishable result table.**"
+    )
+
+    # Query set choice
+    with st.expander("Query set options"):
+        use_full_50 = st.radio(
+            "Query set",
+            ["Use built-in 50-query set", "Enter custom queries"],
+            key="abl_qset",
+        )
+        if use_full_50 == "Enter custom queries":
+            custom_raw = st.text_area(
+                "One query per line (format: query | MeSH term for relevance)",
+                placeholder="breast cancer RNA-seq | Breast Neoplasms\nlung cancer | Lung Neoplasms",
+                height=150,
+                key="abl_custom",
+            )
+            custom_queries = []
+            for line in custom_raw.strip().splitlines():
+                if "|" in line:
+                    q, m = line.split("|", 1)
+                    custom_queries.append({"query": q.strip(), "relevant_mesh": [m.strip()]})
+            queries_to_eval = custom_queries or IR_EVAL_QUERIES
+        else:
+            queries_to_eval = IR_EVAL_QUERIES
+
+    k_abl = st.slider("k for P@k", 5, 20, 10, 5, key="abl_k")
+    run_abl = st.button("▶ Run Ablation Study", key="run_ablation", type="primary")
+
+    CONFIGS = [
+        {"label": "Semantic only",       "semantic": True,  "lexical": False, "mesh": False},
+        {"label": "Lexical only",        "semantic": False, "lexical": True,  "mesh": False},
+        {"label": "Hybrid (no MeSH)",    "semantic": True,  "lexical": True,  "mesh": False},
+        {"label": "Hybrid + MeSH",       "semantic": True,  "lexical": True,  "mesh": True},
+    ]
+
+    if not run_abl:
+        st.info(
+            "Select the query set and k, then click **▶ Run Ablation Study**. "
+            "This runs all 4 retrieval configurations × N queries and reports P@k and MRR for each."
+        )
+        # Show the expected table structure
+        st.markdown("""
+**Expected output format:**
+
+| Configuration | P@10 | MRR | Avg Latency (ms) |
+|---|---|---|---|
+| Semantic only | 0.xxx | 0.xxx | — |
+| Lexical only | 0.xxx | 0.xxx | — |
+| Hybrid (no MeSH) | 0.xxx | 0.xxx | — |
+| **Hybrid + MeSH** | **0.xxx** | **0.xxx** | — |
+        """)
+        return
+
+    from search import HybridSearchEngine
+
+    # For each config, run all queries and compute mean P@k and MRR
+    summary_rows = []
+    all_per_query: dict[str, list[dict]] = {cfg["label"]: [] for cfg in CONFIGS}
+    n_total = len(CONFIGS) * len(queries_to_eval)
+    progress = st.progress(0)
+    status = st.empty()
+    done = 0
+
+    for cfg in CONFIGS:
+        for q_entry in queries_to_eval:
+            status.text(f"[{done+1}/{n_total}] {cfg['label']} | {q_entry['query']}")
+            try:
+                with SessionLocal() as db:
+                    engine = HybridSearchEngine(db)
+
+                    metrics = _evaluate_query_ir(
+                        q_entry["query"], q_entry["relevant_mesh"], engine, db,
+                        k=k_abl,
+                        use_semantic=cfg["semantic"],
+                        use_lexical=cfg["lexical"],
+                        use_mesh=cfg["mesh"],
+                    )
+                    elapsed = metrics["latency_ms"]
+                all_per_query[cfg["label"]].append({
+                    "query": q_entry["query"],
+                    f"P@{k_abl}": metrics["P@10"],
+                    "RR": metrics["RR"],
+                    "latency_ms": elapsed,
+                })
+            except Exception as e:
+                st.error(f"[{cfg['label']}] '{q_entry['query']}' failed: {type(e).__name__}: {e}")
+                all_per_query[cfg["label"]].append({
+                    "query": q_entry["query"],
+                    f"P@{k_abl}": 0.0,
+                    "RR": 0.0,
+                    "latency_ms": None,
+                })
+            done += 1
+            progress.progress(done / n_total)
+
+    status.empty()
+    progress.empty()
+
+    # Aggregate per config
+    for cfg in CONFIGS:
+        per_q = all_per_query[cfg["label"]]
+        valid = [q for q in per_q if isinstance(q[f"P@{k_abl}"], float)]
+        mean_p   = sum(q[f"P@{k_abl}"] for q in valid) / len(valid) if valid else 0
+        mean_mrr = sum(q["RR"] for q in valid) / len(valid) if valid else 0
+        lats = [q["latency_ms"] for q in valid if q["latency_ms"]]
+        mean_lat = sum(lats) / len(lats) if lats else None
+        summary_rows.append({
+            "Configuration": cfg["label"],
+            f"P@{k_abl}": round(mean_p, 3),
+            "MRR": round(mean_mrr, 3),
+            "Avg Latency (ms)": round(mean_lat) if mean_lat else "—",
+            "Queries": len(valid),
+        })
+
+    df_abl = pd.DataFrame(summary_rows)
+    st.subheader(f"Ablation Results — {len(queries_to_eval)} queries · k={k_abl}")
+    st.dataframe(df_abl, use_container_width=True, hide_index=True)
+
+    # Bar chart: P@k and MRR side by side for all configurations
+    geo_rows = summary_rows
+    chart_df = pd.DataFrame({
+        "Configuration": [r["Configuration"] for r in geo_rows],
+        f"P@{k_abl}": [r[f"P@{k_abl}"] for r in geo_rows],
+        "MRR": [r["MRR"] for r in geo_rows],
+    }).set_index("Configuration")
+    st.bar_chart(chart_df)
+
+    # Best config callout
+    best = max(geo_rows, key=lambda r: r["MRR"])
+    st.success(
+        f"Best configuration: **{best['Configuration']}** "
+        f"— P@{k_abl} = {best[f'P@{k_abl}']:.3f}, MRR = {best['MRR']:.3f}"
+    )
+
+    # Per-query breakdown
+    with st.expander("Per-query breakdown"):
+        all_rows = []
+        for cfg in CONFIGS:
+            for entry in all_per_query[cfg["label"]]:
+                all_rows.append({
+                    "Config": cfg["label"],
+                    "Query": entry["query"],
+                    f"P@{k_abl}": entry[f"P@{k_abl}"],
+                    "RR": entry["RR"],
+                })
+        st.dataframe(pd.DataFrame(all_rows), use_container_width=True, hide_index=True)
+
+
 # ── main entry point ───────────────────────────────────────────────────────────
 
 def show_analytics_dashboard():
     st.title("Analytics Dashboard")
     st.caption("Database statistics, metadata coverage, MeSH tagging, search benchmarking, and performance profiling.")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
         "📊 Overview",
         "🔬 Study Types",
         "🧬 Organisms",
@@ -544,6 +1140,9 @@ def show_analytics_dashboard():
         "🎯 Search Benchmark",
         "⚡ Pipeline Comparison",
         "⏱️ Performance",
+        "📐 IR Evaluation",
+        "🗺️ Topic Clusters",
+        "🔬 Ablation Study",
     ])
 
     with tab1:
@@ -568,3 +1167,12 @@ def show_analytics_dashboard():
 
     with tab7:
         _section_performance()
+
+    with tab8:
+        _section_ir_evaluation()
+
+    with tab9:
+        _section_kmeans_clustering()
+
+    with tab10:
+        _section_formal_ablation()

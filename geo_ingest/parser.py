@@ -48,6 +48,9 @@ class GEOParser:
 
         # Extract and clean fields
         title = GEOParser._clean_text(raw_data.get("title", ""))
+        if not title:
+            logger.warning(f"Skipping {accession}: title is empty")
+            return {}
         summary = GEOParser._clean_text(raw_data.get("summary", ""))
         overall_design = GEOParser._clean_text(raw_data.get("overall_design", ""))
 
@@ -139,7 +142,7 @@ class GEOParser:
             normalized_org = mappings.get(org_lower, org)
             normalized.append(normalized_org)
 
-        return list(set(normalized))  # Remove duplicates
+        return list(dict.fromkeys(normalized))  # Remove duplicates, preserve order
 
     @staticmethod
     def _infer_tech_type(text: str) -> str:
@@ -201,6 +204,8 @@ class GEOParser:
             "%Y%m%d",
             "%Y/%m/%d %H:%M",
             "%Y-%m-%d %H:%M:%S",
+            "%b %d %Y",    # Jan 02 2024 (GEO SOFT text format)
+            "%b %d, %Y",
         ]
 
         for fmt in formats:
@@ -253,5 +258,15 @@ class GEOParser:
         if tech_type and tech_type != "unknown":
             parts.append(f"Technology: {tech_type}")
 
+        # Add MeSH tags — these are biomedical controlled vocabulary terms already
+        # assigned to this dataset. Injecting them anchors the embedding vector
+        # directly in biomedical concept space, improving recall for disease queries.
+        mesh_terms = metadata.get("mesh_terms", [])
+        if mesh_terms:
+            parts.append(f"MeSH: {', '.join(mesh_terms)}")
+
         text = " ".join(parts)
-        return GEOParser._clean_text(text)
+        text = GEOParser._clean_text(text)
+        # Cap at ~2000 chars to stay within the 512-token limit of sentence-transformer models.
+        # Truncation here is preferable to silent truncation inside the model.
+        return text[:2000]

@@ -4,16 +4,16 @@ Implements Reciprocal Rank Fusion (RRF) for result merging.
 """
 import logging
 import re
-from datetime import datetime
 from typing import Any
 
-from sqlalchemy import String, and_, cast, func, or_, text
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy import String, and_, func, or_
 from sqlalchemy.orm import Session
 
 from config import settings
-from db import GSEMesh, GSESeries, MeshTerm, get_db
+from db import GSEMesh, GSESeries, MeshTerm, SessionLocal
 from mesh.query_expand import QueryExpander
+from search.judge import judge as llm_judge
+from search.rewrite import rewrite as llm_rewrite
 from vector.search import semantic_search
 
 logger = logging.getLogger(__name__)
@@ -41,7 +41,8 @@ class HybridSearchEngine:
         use_semantic: bool = True,
         use_lexical: bool = True,
         use_mesh: bool = True,
-        top_k: int | None = None,  # kept for API compatibility but no longer limits results
+        top_k: int | None = None,
+        use_judge: bool | None = None,
     ) -> dict[str, Any]:
         """
         Perform hybrid search.
@@ -52,7 +53,6 @@ class HybridSearchEngine:
             use_semantic: Enable semantic search
             use_lexical: Enable lexical/keyword search
             use_mesh: Enable MeSH expansion
-            top_k: Number of results to return
 
         Returns:
             Dictionary with:
@@ -64,47 +64,137 @@ class HybridSearchEngine:
             >>> results = engine.search(
             ...     query="breast cancer RNA-seq",
             ...     filters={"organisms": ["Homo sapiens"], "tech_type": "rna-seq"},
-            ...     top_k=50,
             ... )
         """
         filters = filters or {}
+
+        # Fast path: bare GSE accession lookup (e.g. "GSE98386")
+        _acc_match = re.fullmatch(r"(GSE\d+)", query.strip(), re.IGNORECASE)
+        if _acc_match:
+            acc = _acc_match.group(1).upper()
+            gse = self.db.query(GSESeries).filter(GSESeries.accession == acc).first()
+            if gse:
+                result = gse.to_dict()
+                result["geo_url"] = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={acc}"
+                result["score"] = 1.0
+                result["rank"] = 1
+                result["tier"] = "relevant"
+                result["reason"] = "Exact accession match"
+                logger.info(f"Exact accession match: {acc}")
+                return {
+                    "results": [result],
+                    "metadata": {
+                        "query": query,
+                        "expanded_query": query,
+                        "mesh_terms": [],
+                        "semantic_count": 0,
+                        "lexical_count": 0,
+                        "total_results": 1,
+                        "filters_applied": filters,
+                        "judge_used": False,
+                    },
+                }
 
         logger.info(
             f"Hybrid search: query='{query}', "
             f"semantic={use_semantic}, lexical={use_lexical}, mesh={use_mesh}"
         )
 
-        # Step 1: MeSH expansion
+        # Step 0: LLM rewriter — extract structured concepts before retrieval.
+        # Controlled by REWRITE_ENABLED=true in .env.
+        # Outputs used downstream:
+        #   - semantic_query: topic concept names joined → cleaner embedding vector
+        #   - filters: organism / date / min_samples auto-parsed from query
+        #   - interpretation, criteria, constraints: passed to judge in Step 7
+        rw_interpretation = ""
+        rw_criteria = ""
+        rw_constraints: list[str] = []
+        semantic_query = query  # default: use raw query if rewriter disabled/fails
+        if settings.rewrite_enabled:
+            try:
+                rw = llm_rewrite(query, effort=settings.rewrite_effort)
+                if not rw["fallback"]:
+                    rw_interpretation = rw["interpretation"]
+                    rw_criteria = rw["criteria"]
+                    rw_constraints = rw["constraints"]
+
+                    # Use topic concept names as semantic query — removes filler
+                    # words ("datasets", "after 2023") that dilute the embedding
+                    if rw["topic_names"]:
+                        semantic_query = " ".join(rw["topic_names"])
+                        logger.info(f"Rewriter: semantic_query='{semantic_query}'")
+
+                    # Rewriter-extracted hard filters (organism, date, min_samples)
+                    # are NOT injected into retrieval — they collapse results too
+                    # aggressively for queries like "COVID-19 datasets from 2020".
+                    # The judge enforces these constraints via the criteria string.
+                    # Caller-supplied filters (from UI dropdowns) still apply as before.
+                    raw = rw.get("raw", {})
+
+                    logger.info(
+                        f"Rewriter: interpretation='{rw_interpretation[:80]}' "
+                        f"exclude={rw['exclude_names']} "
+                        f"filters_added={list(filters.keys())}"
+                    )
+                else:
+                    logger.warning("Rewriter fallback: LLM unavailable, using raw query")
+            except Exception as e:
+                logger.error(f"Rewriter failed, continuing with raw query: {e}", exc_info=True)
+
+        # Step 1: MeSH expansion (includes spelling correction pre-pass)
         expansion_result = None
         expanded_query = query
+        corrected_query = query  # may differ from query if spelling was corrected
         matched_mesh_ids = []
 
+        mesh_concept_groups: list[set[str]] = []
         if use_mesh:
-            expansion_result = self.query_expander.expand_query(query)
+            expansion_result = self.query_expander.expand_query(query, max_terms=8)
             expanded_query = expansion_result["expanded_query"]
+            corrected_query = expansion_result.get("corrected_query", query)
             matched_mesh_ids = [term["mesh_id"] for term in expansion_result["matched_terms"]]
             logger.info(f"MeSH expansion: {len(matched_mesh_ids)} terms matched")
 
+            # Build concept groups: group MeSH IDs by the query token that produced them.
+            # Each distinct source token represents a separate concept in the query
+            # (e.g. "breast cancer" and "organ transplant" are two different concepts).
+            # Used by _mesh_only_search to require intersection across concepts.
+            token_to_ids: dict[str, set[str]] = {}
+            for term in expansion_result["matched_terms"]:
+                src = term.get("source_token", "")
+                token_to_ids.setdefault(src, set()).add(term["mesh_id"])
+            mesh_concept_groups = list(token_to_ids.values())
+
         # Step 2: Semantic search
+        # Pass original query and MeSH-expanded query separately so the search
+        # layer blends them as a weighted average vector (0.7 original + 0.3 expanded).
+        # This prevents long MeSH synonym lists from diluting the query intent.
         semantic_results = []
         if use_semantic:
             try:
-                semantic_results = semantic_search(
-                    query=expanded_query,
+                # When rewriter is active, semantic_query = topic concept names
+                # (e.g. "glioma glioma cells glioma tissue") — a cleaner vector
+                # than the raw query which may contain filler words or date phrases.
+                # When rewriter is off, semantic_query == query (raw, unchanged).
+                _sem_q = semantic_query if settings.rewrite_enabled and semantic_query != query else corrected_query
+                _exp = expanded_query if (use_mesh and expanded_query != corrected_query) else None
+                # Fetch once at the lowest acceptable threshold (0.45); results above
+                # higher thresholds naturally rank first because Milvus returns by score.
+                # This avoids up to 4 redundant round-trips to Milvus.
+                all_semantic = semantic_search(
+                    query=_sem_q,
+                    expanded_query=_exp,
                     top_k=settings.semantic_top_k,
-                    min_score=0.65,
+                    min_score=0.45,
                 )
-                # If too few results, the query may be a lay term whose embedding
-                # lands far from clinical vocabulary — relax threshold to recover recall
-                if len(semantic_results) < 50:
-                    semantic_results = semantic_search(
-                        query=expanded_query,
-                        top_k=settings.semantic_top_k,
-                        min_score=0.60,
-                    )
-                    logger.info(f"Semantic search (relaxed threshold): {len(semantic_results)} results")
-                else:
-                    logger.info(f"Semantic search: {len(semantic_results)} results")
+                # Apply a tighter threshold when enough high-quality results exist,
+                # falling back to lower thresholds progressively.
+                for threshold in (0.65, 0.60, 0.50, 0.45):
+                    filtered = [r for r in all_semantic if r["score"] >= threshold]
+                    if len(filtered) >= 50 or threshold == 0.45:
+                        semantic_results = filtered
+                        break
+                logger.info(f"Semantic search: {len(semantic_results)} results")
             except Exception as e:
                 logger.error(f"Semantic search failed: {e}", exc_info=True)
                 # Continue without semantic results
@@ -113,41 +203,138 @@ class HybridSearchEngine:
         # so each is OR'd, not AND'd together
         lexical_results = []
         if use_lexical:
-            # Cap MeSH expansion to top 5 most specific terms to prevent over-retrieval.
-            # Too many OR'd MeSH synonyms cause broad queries like "lung cancer" to match
-            # thousands of loosely related datasets.
+            # Cap MeSH expansion to prevent over-retrieval in lexical OR chain.
+            # Single-concept queries: cap at 5 — broad terms like "lung cancer" already
+            # match thousands of datasets; more synonyms inflate noise further.
+            # Multi-concept queries: allow up to 8 — each concept group maps to 2–4 MeSH
+            # descriptors (e.g. IDH1 glioma subtypes, HBV + hepatocellular carcinoma),
+            # so a tighter cap would miss valid disease-subtype terms.
             all_mesh_terms = [t["preferred_name"] for t in (expansion_result["matched_terms"] if expansion_result else [])]
-            mesh_preferred = all_mesh_terms[:5]
+            mesh_cap = 8 if len(mesh_concept_groups) > 1 else 5
+            mesh_preferred = all_mesh_terms[:mesh_cap]
+            # Build mesh_id → preferred_name lookup for concept group AND logic
+            mesh_id_to_name = {
+                t["mesh_id"]: t["preferred_name"]
+                for t in (expansion_result["matched_terms"] if expansion_result else [])
+            }
             lexical_results = self._lexical_search(
-                query=query,
+                query=corrected_query,
                 mesh_terms=mesh_preferred,
                 filters=filters,
+                mesh_concept_groups=mesh_concept_groups if use_mesh else None,
+                mesh_id_to_name=mesh_id_to_name if use_mesh else None,
             )
             logger.info(f"Lexical search: {len(lexical_results)} results")
 
-        # Step 4: Combine results using RRF
+        # Step 4: MeSH-only retrieval — fetch datasets directly tagged with matched
+        # MeSH IDs. This is the primary retrieval path when use_mesh=True and the
+        # query term is a precise MeSH descriptor (e.g. "Vitiligo") that may not
+        # appear verbatim in dataset text but IS stored in the gse_mesh table.
+        # For multi-concept queries, intersection logic is applied across concept groups.
+        mesh_only_results = []
+        if use_mesh and matched_mesh_ids:
+            mesh_only_results = self._mesh_only_search(
+                matched_mesh_ids, filters, mesh_concept_groups
+            )
+            logger.info(f"MeSH-only search: {len(mesh_only_results)} results")
+
+        # Step 5: Combine results using RRF
         combined_results = self._reciprocal_rank_fusion(
             semantic_results=semantic_results,
             lexical_results=lexical_results,
+            mesh_only_results=mesh_only_results,
             matched_mesh_ids=matched_mesh_ids,
         )
 
-        # Step 5: Apply filters and fetch full metadata — no cap, return all matches
+        # Step 6: Apply filters and fetch full metadata
+        ranked = combined_results[:top_k if top_k is not None else settings.final_top_k]
         final_results = self._fetch_and_filter_results(
-            ranked_accessions=combined_results,
+            ranked_accessions=ranked,
             filters=filters,
             matched_mesh_ids=matched_mesh_ids,
         )
 
+        # Step 7: LLM judge — post-retrieval relevance filter (Phase 1 integration).
+        # Controlled by JUDGE_ENABLED=true in .env. When disabled, results are
+        # returned as-is with tier="unjudged" and reason="" on every result.
+        judge_meta = {"judge_used": False, "relevant_count": 0, "borderline_count": 0,
+                      "unjudged_count": 0, "judge_coverage": 0}
+        run_judge = settings.judge_enabled if use_judge is None else use_judge
+        if run_judge and final_results:
+            to_judge = final_results[:settings.judge_top_k]
+            remainder = final_results[settings.judge_top_k:]
+            try:
+                jd = llm_judge(
+                    query=query,
+                    interpretation=rw_interpretation,
+                    items=to_judge,
+                    constraints=rw_constraints,
+                    criteria=rw_criteria,
+                    effort=settings.judge_effort,
+                )
+                # Attach tier + reason to each judged result
+                for r in to_judge:
+                    call = jd["calls"].get(r["accession"])
+                    if call:
+                        r["tier"] = call["tier"]
+                        r["reason"] = call["reason"]
+                    else:
+                        r["tier"] = "unjudged"
+                        r["reason"] = ""
+                # Remainder (beyond judge_top_k) are unjudged but still returned
+                for r in remainder:
+                    r["tier"] = "unjudged"
+                    r["reason"] = ""
+                # Sort judged results: relevant first, borderline next, unjudged,
+                # not_relevant last — nothing is removed, preserving recall.
+                # Newest-first within each tier.
+                TIER_ORDER = {"relevant": 0, "borderline": 1, "unjudged": 2, "not_relevant": 3}
+                from itertools import groupby
+                to_judge.sort(key=lambda r: TIER_ORDER.get(r.get("tier", "unjudged"), 9))
+                tier_sorted = []
+                for _, grp in groupby(to_judge, key=lambda r: TIER_ORDER.get(r.get("tier", "unjudged"), 9)):
+                    tier_sorted.extend(sorted(grp, key=lambda r: str(r.get("submission_date") or ""), reverse=True))
+                final_results = tier_sorted + remainder
+                judge_meta = {
+                    "judge_used": jd["judged"],
+                    "relevant_count": sum(1 for r in to_judge if r.get("tier") == "relevant"),
+                    "borderline_count": sum(1 for r in to_judge if r.get("tier") == "borderline"),
+                    "not_relevant_count": sum(1 for r in to_judge if r.get("tier") == "not_relevant"),
+                    "unjudged_count": len(jd.get("unjudged", [])),
+                    "judge_coverage": len(to_judge),
+                }
+                logger.info(
+                    f"Judge: relevant={judge_meta['relevant_count']} "
+                    f"borderline={judge_meta['borderline_count']} "
+                    f"not_relevant={judge_meta['not_relevant_count']} "
+                    f"unjudged={judge_meta['unjudged_count']}"
+                )
+            except Exception as e:
+                logger.error(f"Judge failed, returning unfiltered results: {e}", exc_info=True)
+                for r in final_results:
+                    r["tier"] = "unjudged"
+                    r["reason"] = ""
+        else:
+            # Judge disabled: mark all results as unjudged
+            for r in final_results:
+                r.setdefault("tier", "unjudged")
+                r.setdefault("reason", "")
+
         # Prepare metadata
         metadata = {
             "query": query,
+            "interpretation": rw_interpretation,
+            "criteria": rw_criteria,
+            "constraints": rw_constraints,
+            "semantic_query": semantic_query,
             "expanded_query": expanded_query if use_mesh else query,
             "mesh_terms": expansion_result["matched_terms"] if expansion_result else [],
             "semantic_count": len(semantic_results),
             "lexical_count": len(lexical_results),
+            "mesh_count": len(mesh_only_results),
             "total_results": len(final_results),
             "filters_applied": filters,
+            **judge_meta,
         }
 
         logger.info(f"Hybrid search complete: {len(final_results)} results")
@@ -162,19 +349,19 @@ class HybridSearchEngine:
         query: str,
         filters: dict[str, Any],
         mesh_terms: list[str] | None = None,
-        top_k: int = 0,  # unused — kept for signature compat
+        mesh_concept_groups: list[set[str]] | None = None,
+        mesh_id_to_name: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Perform lexical/keyword search using PostgreSQL full-text search.
-        Uses tsvector/tsquery which is index-backed and far faster than LIKE.
+        Perform lexical search using PostgreSQL full-text search.
 
-        Args:
-            query: Search query
-            filters: Structured filters
-            top_k: Number of results
+        For single-concept queries: original OR logic — MeSH terms are OR'd in
+        as additional match pathways alongside the original query tokens.
 
-        Returns:
-            List of results with accession and relevance score
+        For multi-concept queries: AND logic across concept groups — a dataset
+        must contain tokens from EACH concept group in its text. This aligns
+        with NCBI's behaviour where all query concepts must appear in the record.
+        MeSH preferred names are used as the representative token per group.
         """
         # Convert query to a PostgreSQL websearch tsquery (handles phrases, AND, OR)
         # Falls back to plain to_tsquery if empty after stripping short tokens
@@ -194,8 +381,108 @@ class HybridSearchEngine:
             )
         )
 
-        ts_rank = func.ts_rank(tsvec, tsquery)
-        ts_match = tsvec.op("@@")(tsquery)
+        # Build tsquery strategy:
+        # 1. Original query as a whole phrase AND (plainto_tsquery) — most precise
+        # 2. Per-word prefix tsquery AND'd together — catches stemming variants:
+        #    "pancreatic cancer" query matches records saying "pancreas cancer"
+        #    because to_tsquery('pancrea:*') matches both pancreas and pancreatic
+        # 3. Each MeSH preferred name OR'd in as an additional match pathway
+        # Result: (phrase OR prefix_word1 & prefix_word2 OR MeSH1 OR MeSH2 ...)
+        original_tsquery = func.plainto_tsquery("english", query)
+
+        # Build per-word prefix AND query (catches stemming variants like pancreas/pancreatic)
+        # Known 2-letter biomedical abbreviations that are meaningful query terms
+        KNOWN_SHORT_TERMS = {"ar", "il", "ck", "nk", "pd", "er", "pr"}
+        query_words = [w.strip("\"'(),.") for w in query.split()
+                       if len(w.strip("\"'(),.")) >= 3
+                       or w.strip("\"'(),.").lower() in KNOWN_SHORT_TERMS]
+        if len(query_words) > 1:
+            # Use prefix matching: 'pancreatic' → 'pancrea:*' catches pancreas/pancreatic
+            prefix_parts = " & ".join(f"{w[:6]}:*" for w in query_words)
+            prefix_tsquery = func.to_tsquery("english", prefix_parts)
+            combined_tsquery = original_tsquery.op("||")(prefix_tsquery)
+        else:
+            combined_tsquery = original_tsquery
+
+        # Cancer-domain synonym expansion: if query contains a cancer term, also match
+        # records using alternative oncology vocabulary (tumor, neoplasm, carcinoma, PDAC etc.)
+        # that NCBI catches via PubMed MeSH linkage but we don't have sample-level metadata for.
+        CANCER_SYNONYMS = {"cancer", "tumor", "tumour", "neoplas", "carcinoma", "malignancy", "adenocarcinoma"}
+        query_lower = query.lower()
+        has_cancer_term = any(syn in query_lower for syn in CANCER_SYNONYMS)
+        has_organ_term = any(
+            w for w in query_words
+            if w.lower() not in CANCER_SYNONYMS and len(w) >= 4
+        )
+        if has_cancer_term and has_organ_term:
+            organ_words = [w for w in query_words if w.lower() not in CANCER_SYNONYMS and len(w) >= 4]
+            # Use up to 8 chars for organ prefix to reduce false matches (e.g. pancrea:* → pancreatic/pancreas only)
+            organ_prefix = " & ".join(f"{w[:8]}:*" for w in organ_words)
+            cancer_variants = "cancer:* | tumor:* | neoplas:* | carcinoma:* | adenocarcinoma:* | malign:*"
+            expanded_parts = f"({organ_prefix}) & ({cancer_variants})"
+            try:
+                expanded_tsquery = func.to_tsquery("english", expanded_parts)
+                combined_tsquery = combined_tsquery.op("||")(expanded_tsquery)
+            except Exception:
+                pass  # fallback: skip expansion if tsquery syntax fails
+
+        # Hard-coded lexical aliases for terms that FTS tokenizes poorly.
+        # "CAR-T" → PostgreSQL splits to "car" + "t" (both too short/generic).
+        # Inject the full clinical phrase directly into the tsquery instead.
+        # OR in each MeSH preferred name as a whole phrase.
+        # This is critical for lay-term queries like "heart attack" where the original
+        # words don't appear in clinical papers — the MeSH terms drive lexical recall.
+        for mt in (mesh_terms or []):
+            mt_cleaned = mt.strip("\"'(),.")
+            if len(mt_cleaned) >= 3:
+                combined_tsquery = combined_tsquery.op("||")(
+                    func.plainto_tsquery("english", mt_cleaned)
+                )
+                # Add prefix variant only for long clinical words not already in the query
+                # e.g. "Myocardial Infarction" → "myocard:*" catches myocardial/myocardium
+                # Skip short anatomy words like "lung", "small" that over-match
+                mt_words = mt_cleaned.split()
+                query_words_lower = query.lower().split()
+                if (len(mt_words) >= 2
+                        and len(mt_words[0]) >= 8
+                        and mt_words[0].lower() not in query_words_lower):
+                    prefix = mt_words[0][:7].lower()
+                    try:
+                        combined_tsquery = combined_tsquery.op("||")(
+                            func.to_tsquery("english", f"{prefix}:*")
+                        )
+                    except Exception:
+                        pass
+
+        ts_rank = func.ts_rank(tsvec, combined_tsquery)
+        ts_match = tsvec.op("@@")(combined_tsquery)
+
+        # Multi-concept AND refinement: when multiple distinct concept groups are
+        # detected (e.g. "breast cancer" + "organ transplant"), require the dataset
+        # text to contain at least one token from EACH group. This mirrors NCBI's
+        # AND behaviour and prevents single-concept datasets from flooding results.
+        # Each group is represented by its MeSH preferred names OR'd within the group,
+        # then all groups are AND'd together as an additional filter condition.
+        if mesh_concept_groups and len(mesh_concept_groups) > 1 and mesh_id_to_name:
+            group_conditions = []
+            for group_ids in mesh_concept_groups:
+                group_names = [mesh_id_to_name[mid] for mid in group_ids if mid in mesh_id_to_name]
+                if not group_names:
+                    continue
+                # Build OR tsquery for all names in this concept group
+                group_tsquery = None
+                for name in group_names:
+                    name_cleaned = name.strip("\"'(),.")
+                    if len(name_cleaned) < 3:
+                        continue
+                    tq = func.plainto_tsquery("english", name_cleaned)
+                    group_tsquery = tq if group_tsquery is None else group_tsquery.op("||")(tq)
+                if group_tsquery is not None:
+                    group_conditions.append(tsvec.op("@@")(group_tsquery))
+
+            if len(group_conditions) > 1:
+                # AND across all concept groups — dataset must match all groups
+                ts_match = and_(ts_match, *group_conditions)
 
         filter_conditions = self._build_filter_conditions(filters)
         base_filter = and_(ts_match, *filter_conditions) if filter_conditions else ts_match
@@ -242,9 +529,18 @@ class HybridSearchEngine:
 
         # Date range filter
         if date_range := filters.get("date_range"):
-            start_date = date_range.get("start")
-            end_date = date_range.get("end")
-
+            from datetime import date as _date, datetime as _datetime
+            def _to_date(v):
+                if isinstance(v, _date):
+                    return v
+                if isinstance(v, _datetime):
+                    return v.date()
+                try:
+                    return _date.fromisoformat(str(v)[:10])
+                except (ValueError, TypeError):
+                    return None
+            start_date = _to_date(date_range.get("start"))
+            end_date = _to_date(date_range.get("end"))
             if start_date:
                 conditions.append(GSESeries.submission_date >= start_date)
             if end_date:
@@ -256,11 +552,118 @@ class HybridSearchEngine:
 
         return conditions
 
+    def _mesh_only_search(
+        self,
+        matched_mesh_ids: list[str],
+        filters: dict[str, Any],
+        mesh_concept_groups: list[set[str]] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Retrieve datasets directly tagged with matched MeSH IDs.
+
+        When mesh_concept_groups is provided, intersection logic is applied across
+        concept groups that have meaningful dataset coverage (> 10 tagged datasets).
+        Groups with ≤ 10 datasets are skipped — they represent either zero-coverage
+        MeSH terms or bad expansions from stopword bigrams (e.g. "tumor and" → wrong
+        MeSH match) that would collapse the intersection to zero.
+
+        If fewer than 2 groups survive the coverage filter, falls back to union retrieval.
+        For single-concept queries the union logic always applies.
+        """
+        # Single-concept query: union retrieval — return all datasets matching any MeSH ID.
+        if not mesh_concept_groups or len(mesh_concept_groups) <= 1:
+            rows = (
+                self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+                .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+                .group_by(GSEMesh.accession)
+                .order_by(func.count(GSEMesh.mesh_id).desc())
+                .all()
+            )
+            return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
+
+        # Multi-concept query: intersection across concept groups, but only for groups
+        # with meaningful dataset coverage (> MIN_GROUP_COVERAGE).
+        #
+        # Groups with ≤ MIN_GROUP_COVERAGE datasets are skipped before intersecting.
+        # This handles two failure modes:
+        #   1. Zero-coverage groups: a MeSH term exists but no datasets are tagged with it
+        #      (e.g. "DNA Methylation" D019175 has 0 tagged datasets in our DB).
+        #   2. Bad expansions from stopword bigrams: tokens like "tumor and", "normal in",
+        #      "ar signaling" partially match unrelated MeSH terms with 0–5 dataset tags.
+        #      These spurious groups would collapse the intersection to zero or near-zero,
+        #      discarding all valid results from the well-matched groups.
+        # If fewer than 2 groups survive the coverage filter, fall back to union retrieval.
+        MIN_GROUP_COVERAGE = 10
+
+        # Count tagged datasets per group and filter out low-coverage groups
+        qualified_groups: list[set[str]] = []
+        for group in mesh_concept_groups:
+            cnt = (
+                self.db.query(func.count(GSEMesh.accession.distinct()))
+                .filter(GSEMesh.mesh_id.in_(group))
+                .scalar()
+            ) or 0
+            if cnt > MIN_GROUP_COVERAGE:
+                qualified_groups.append(group)
+
+        # Fewer than 2 qualified groups → AND would be meaningless; fall back to union
+        if len(qualified_groups) <= 1:
+            rows = (
+                self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+                .filter(GSEMesh.mesh_id.in_(matched_mesh_ids))
+                .group_by(GSEMesh.accession)
+                .order_by(func.count(GSEMesh.mesh_id).desc())
+                .all()
+            )
+            return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
+
+        # Intersect progressively across qualified groups (smallest first)
+        groups_sorted = sorted(qualified_groups, key=len)
+
+        candidate_rows = (
+            self.db.query(GSEMesh.accession)
+            .filter(GSEMesh.mesh_id.in_(groups_sorted[0]))
+            .distinct()
+            .all()
+        )
+        candidate_accessions = {row.accession for row in candidate_rows}
+
+        for group in groups_sorted[1:]:
+            if not candidate_accessions:
+                break
+            group_rows = (
+                self.db.query(GSEMesh.accession)
+                .filter(
+                    GSEMesh.accession.in_(candidate_accessions),
+                    GSEMesh.mesh_id.in_(group),
+                )
+                .distinct()
+                .all()
+            )
+            candidate_accessions = {row.accession for row in group_rows}
+
+        if not candidate_accessions:
+            return []
+
+        # Score by total matched MeSH IDs across all groups within the intersection set
+        rows = (
+            self.db.query(GSEMesh.accession, func.count(GSEMesh.mesh_id).label("match_count"))
+            .filter(
+                GSEMesh.accession.in_(candidate_accessions),
+                GSEMesh.mesh_id.in_(matched_mesh_ids),
+            )
+            .group_by(GSEMesh.accession)
+            .order_by(func.count(GSEMesh.mesh_id).desc())
+            .all()
+        )
+        return [{"accession": acc, "score": float(cnt)} for acc, cnt in rows]
+
     def _reciprocal_rank_fusion(
         self,
         semantic_results: list[dict[str, Any]],
         lexical_results: list[dict[str, Any]],
         matched_mesh_ids: list[str],
+        mesh_only_results: list[dict[str, Any]] | None = None,
         k: int | None = None,
     ) -> list[str]:
         """
@@ -272,6 +675,7 @@ class HybridSearchEngine:
             semantic_results: Results from semantic search
             lexical_results: Results from lexical search
             matched_mesh_ids: MeSH IDs matched in query expansion
+            mesh_only_results: Results from direct MeSH tag lookup
             k: RRF constant (default: from settings)
 
         Returns:
@@ -282,16 +686,32 @@ class HybridSearchEngine:
 
         scores: dict[str, float] = {}
 
+        # Weighted RRF weights (tuned Sep 2026 vs Azure OpenAI embeddings):
+        # - Semantic 2.0: preserves precision for concept/acronym queries
+        # - Lexical 1.5: boosted from 1.0 to improve signaling pathway queries
+        #   (NFkB, TGFb, AR signaling) where keyword matching outperforms semantic
+        # - MeSH 1.5: boosted from 1.0 to lift MeSH-tagged disease/organism datasets
+        #   that regressed vs PubMedBERT (Mycobacterium tuberculosis, HBV-related HCC)
+        SEMANTIC_WEIGHT = 2.0
+        LEXICAL_WEIGHT = 1.5
+        MESH_WEIGHT = 1.5
+
         # Add semantic results
         for rank, result in enumerate(semantic_results, start=1):
             accession = result["accession"]
-            rrf_score = 1.0 / (k + rank)
+            rrf_score = SEMANTIC_WEIGHT / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
 
         # Add lexical results
         for rank, result in enumerate(lexical_results, start=1):
             accession = result["accession"]
-            rrf_score = 1.0 / (k + rank)
+            rrf_score = LEXICAL_WEIGHT / (k + rank)
+            scores[accession] = scores.get(accession, 0.0) + rrf_score
+
+        # Add MeSH-only results (direct tag lookup)
+        for rank, result in enumerate(mesh_only_results or [], start=1):
+            accession = result["accession"]
+            rrf_score = MESH_WEIGHT / (k + rank)
             scores[accession] = scores.get(accession, 0.0) + rrf_score
 
         # Boost scores for datasets with matching MeSH terms
@@ -353,7 +773,6 @@ class HybridSearchEngine:
             ranked_accessions: List of accessions in rank order
             filters: Structured filters
             matched_mesh_ids: MeSH IDs for highlighting
-            top_k: Number of results to return
 
         Returns:
             List of result dictionaries with full metadata
@@ -436,13 +855,26 @@ class HybridSearchEngine:
         if date_range := filters.get("date_range"):
             if not gse.submission_date:
                 return False
-
-            start_date = date_range.get("start")
-            end_date = date_range.get("end")
-
-            if start_date and gse.submission_date < start_date:
+            from datetime import date as _date, datetime as _datetime
+            def _to_date(v):
+                if v is None:
+                    return None
+                if isinstance(v, _date):
+                    return v
+                if isinstance(v, _datetime):
+                    return v.date()
+                try:
+                    return _date.fromisoformat(str(v)[:10])
+                except (ValueError, TypeError):
+                    return None
+            gse_date = _to_date(gse.submission_date)
+            start_date = _to_date(date_range.get("start"))
+            end_date = _to_date(date_range.get("end"))
+            if gse_date is None:
                 return False
-            if end_date and gse.submission_date > end_date:
+            if start_date and gse_date < start_date:
+                return False
+            if end_date and gse_date > end_date:
                 return False
 
         # Sample count filter
@@ -456,7 +888,6 @@ class HybridSearchEngine:
 def search_geo(
     query: str,
     filters: dict[str, Any] | None = None,
-    top_k: int = 50,
     db: Session | None = None,
 ) -> dict[str, Any]:
     """
@@ -465,65 +896,20 @@ def search_geo(
     Args:
         query: Search query
         filters: Optional filters
-        top_k: Number of results
         db: Optional database session
 
     Returns:
         Search results dictionary
     """
     if db is None:
-        db_gen = get_db()
-        db = next(db_gen)
+        db = SessionLocal()
         close_db = True
     else:
         close_db = False
 
     try:
         engine = HybridSearchEngine(db)
-        return engine.search(query=query, filters=filters, top_k=top_k)
+        return engine.search(query=query, filters=filters)
     finally:
         if close_db:
             db.close()
-
-
-def make_snippet(text: str, query_terms: list[str], max_length: int = 200) -> str:
-    """
-    Create a highlighted snippet from text.
-
-    Args:
-        text: Full text
-        query_terms: Terms to highlight
-        max_length: Maximum snippet length
-
-    Returns:
-        Snippet with context around matches
-    """
-    if not text or not query_terms:
-        return text[:max_length] + "..." if len(text) > max_length else text
-
-    text_lower = text.lower()
-
-    # Find first match
-    first_match_pos = len(text)
-    for term in query_terms:
-        pos = text_lower.find(term.lower())
-        if pos != -1 and pos < first_match_pos:
-            first_match_pos = pos
-
-    if first_match_pos == len(text):
-        # No matches, return beginning
-        return text[:max_length] + "..." if len(text) > max_length else text
-
-    # Extract context around match
-    start = max(0, first_match_pos - 50)
-    end = min(len(text), first_match_pos + max_length)
-
-    snippet = text[start:end]
-
-    # Add ellipsis
-    if start > 0:
-        snippet = "..." + snippet
-    if end < len(text):
-        snippet = snippet + "..."
-
-    return snippet

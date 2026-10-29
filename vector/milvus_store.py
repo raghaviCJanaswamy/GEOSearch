@@ -17,7 +17,6 @@ from pymilvus import (
 )
 
 from config import settings
-from vector.embeddings import get_embedding_provider
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,8 @@ class MilvusStore:
         self.port = port or settings.milvus_port
         self.collection_name = collection_name or settings.milvus_collection_name
 
-        # Get embedding dimension
-        embedding_provider = get_embedding_provider()
-        self.dimension = embedding_provider.get_dimension()
+        # Read dimension from settings — avoids loading the embedding model just for this value.
+        self.dimension = settings.embedding_dimension
 
         logger.info(
             f"Initializing Milvus store: {self.host}:{self.port}, "
@@ -59,6 +57,15 @@ class MilvusStore:
 
         # Ensure collection exists
         self._ensure_collection()
+
+        # Warn when the collection is large enough that FLAT index becomes slow.
+        # IVF_FLAT is recommended above ~100K vectors — rebuild the index manually.
+        count = self.count()
+        if count > 100_000:
+            logger.warning(
+                f"Collection '{self.collection_name}' has {count:,} vectors and uses a FLAT index. "
+                "Consider rebuilding with IVF_FLAT for faster search at this scale."
+            )
 
     def _connect(self) -> None:
         """Connect to Milvus server."""
@@ -187,7 +194,10 @@ class MilvusStore:
             ]
 
             self.collection.upsert(data)
-            self.collection.flush()
+            # flush() is intentionally omitted here — callers that ingest
+            # large batches should call collection.flush() once at the end
+            # to avoid blocking on every batch. Search still works against
+            # in-memory (unsealed) segments without an explicit flush.
 
             logger.info(f"Successfully upserted {len(embeddings)} embeddings")
 
@@ -223,9 +233,10 @@ class MilvusStore:
         if not query_vector:
             return []
 
+        # nprobe=64 gives good recall for IVF_FLAT; ignored by FLAT index
         search_params = {
-            "metric_type": "IP",  # Inner Product
-            "params": {"nprobe": 10},
+            "metric_type": "IP",
+            "params": {"nprobe": 64},
         }
 
         logger.debug(f"Searching Milvus: top_k={top_k}, filter={filter_expr}")
@@ -296,6 +307,27 @@ class MilvusStore:
         except MilvusException as e:
             logger.error(f"Count failed: {e}")
             return 0
+
+    def rebuild_index_ivf_flat(self, nlist: int = 1024) -> None:
+        """
+        Rebuild the vector index from FLAT to IVF_FLAT for faster search.
+        Recommended once collection exceeds ~100K vectors.
+
+        Args:
+            nlist: Number of cluster centroids (higher = faster search, less accurate).
+                   Rule of thumb: sqrt(num_entities). Default 1024 suits 100K–1M vectors.
+        """
+        logger.info(f"Rebuilding index to IVF_FLAT (nlist={nlist})...")
+        self.collection.release()
+        self.collection.drop_index()
+        index_params = {
+            "metric_type": "IP",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": nlist},
+        }
+        self.collection.create_index(field_name="embedding", index_params=index_params)
+        self.collection.load()
+        logger.info("Index rebuilt to IVF_FLAT and collection reloaded.")
 
     def drop_collection(self) -> None:
         """

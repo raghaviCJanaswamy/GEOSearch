@@ -1,5 +1,5 @@
 """SQLAlchemy ORM models for GEOSearch."""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import (
@@ -21,6 +21,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
 Base = declarative_base()
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class GSESeries(Base):
@@ -60,8 +64,8 @@ class GSESeries(Base):
     raw_record = Column(JSONB)
 
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     # Relationships
     mesh_associations = relationship("GSEMesh", back_populates="gse_series", cascade="all, delete-orphan")
@@ -106,7 +110,7 @@ class MeshTerm(Base):
     tree_numbers = Column(JSONB)  # MeSH tree hierarchy positions
 
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     # Relationships
     gse_associations = relationship("GSEMesh", back_populates="mesh_term")
@@ -137,7 +141,7 @@ class GSEMesh(Base):
     confidence = Column(Float, default=0.5)
 
     # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, nullable=False)
 
     # Relationships
     gse_series = relationship("GSESeries", back_populates="mesh_associations")
@@ -160,7 +164,7 @@ class IngestRun(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     query = Column(Text)  # NCBI search query used
-    start_time = Column(DateTime, default=datetime.utcnow, nullable=False)
+    start_time = Column(DateTime, default=_utcnow, nullable=False)
     end_time = Column(DateTime)
     status = Column(
         Enum("running", "completed", "failed", "partial", name="ingest_status_enum"),
