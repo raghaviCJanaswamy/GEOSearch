@@ -2,14 +2,15 @@
 Re-embed all GSE corpus records using the configured embedding provider.
 
 Reads EMBEDDING_PROVIDER, EMBEDDING_DIMENSION and provider credentials from .env.
-Drops and recreates the Milvus collection when the dimension changes (e.g. switching
-from PubMedBERT 768-dim to text-embedding-3-large 3072-dim).
 
 Usage:
-    python scripts/reembed_all.py [--resume]
+    python scripts/reembed_all.py [--resume] [--rebuild]
 
-    --resume   Skip records already in Milvus (resume interrupted run).
-               Without this flag the collection is dropped and rebuilt from scratch.
+    (default)  If the collection already has vectors, resumes automatically.
+               If the collection is empty or missing, builds from scratch.
+    --resume   Explicitly skip records already in Milvus (same as default).
+    --rebuild  Drop and recreate the collection from scratch (use when switching
+               embedding model/dimension, e.g. PubMedBERT 768 → text-embedding-3-large 3072).
 """
 import os
 import sys
@@ -49,7 +50,7 @@ def embed_with_retry(provider, texts: list[str]) -> list[list[float]]:
 
 
 def main():
-    resume = "--resume" in sys.argv
+    rebuild = "--rebuild" in sys.argv
 
     print(f"Embedding provider  : {settings.embedding_provider}", flush=True)
     print(f"Embedding dimension : {settings.embedding_dimension}", flush=True)
@@ -61,15 +62,17 @@ def main():
 
     print("Connecting to Milvus...", flush=True)
     store = MilvusStore()
+    existing = store.count()
 
-    if not resume:
-        print("Dropping existing Milvus collection to rebuild with new dimension...", flush=True)
+    if rebuild:
+        print("--rebuild flag set: dropping existing collection to rebuild from scratch...", flush=True)
         store.drop_collection()
-        # Re-init store so it creates a fresh collection with the new dimension
         store = MilvusStore()
         print(f"New collection created (dim={store.dimension}).", flush=True)
+    elif existing > 0:
+        print(f"Resume mode: {existing:,} vectors already in Milvus — skipping those accessions.", flush=True)
     else:
-        print("Resume mode: existing vectors will be kept; only missing accessions embedded.", flush=True)
+        print("Collection empty — building from scratch.", flush=True)
 
     parser = GEOParser()
     db = SessionLocal()
@@ -89,6 +92,7 @@ def main():
     print(f"MeSH tags loaded for {len(mesh_map):,} datasets.", flush=True)
 
     done = 0
+    skipped = 0
     errors = 0
     t_start = time.time()
     last_accession = ""
@@ -103,6 +107,22 @@ def main():
         )
         if not batch:
             break
+
+        # In resume mode, skip accessions already present in Milvus
+        if existing > 0:
+            batch_accs = [gse.accession for gse in batch]
+            expr = " || ".join(f'accession == "{a}"' for a in batch_accs)
+            try:
+                hits = store.collection.query(expr=expr, output_fields=["accession"])
+                already_done = {h["accession"] for h in hits}
+            except Exception:
+                already_done = set()
+            if already_done:
+                skipped += len(already_done)
+                batch = [gse for gse in batch if gse.accession not in already_done]
+            if not batch:
+                last_accession = batch_accs[-1]  # advance cursor past this batch
+                continue
 
         texts, accessions = [], []
         for gse in batch:
@@ -146,8 +166,8 @@ def main():
 
     elapsed = time.time() - t_start
     print(
-        f"\nRe-embedding complete. {done:,} records in {elapsed/60:.1f} min. "
-        f"Errors: {errors}",
+        f"\nRe-embedding complete. {done:,} embedded, {skipped:,} skipped (already in Milvus), "
+        f"{errors} errors. Total time: {elapsed/60:.1f} min.",
         flush=True,
     )
 

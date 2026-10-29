@@ -120,6 +120,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
     command: >
       bash -c "
         echo 'Waiting for Postgres to accept connections...' &&
@@ -192,19 +193,17 @@ services:
       NCBI_API_KEY: ${NCBI_API_KEY:-}
       NCBI_TOOL: GEOSearch
       RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-3.0}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-NeuML/pubmedbert-base-embeddings}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-azure_openai}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-large}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-3072}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
       SEMANTIC_TOP_K: ${SEMANTIC_TOP_K:-500}
       LEXICAL_TOP_K: ${LEXICAL_TOP_K:-100}
       FINAL_TOP_K: ${FINAL_TOP_K:-50}
       RRF_K: ${RRF_K:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LLM_PROVIDER: ${LLM_PROVIDER:-auto}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
       LLM_MODEL: ${LLM_MODEL:-}
       STREAMLIT_SERVER_PORT: 8501
       STREAMLIT_SERVER_ADDRESS: 0.0.0.0
@@ -222,25 +221,13 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
-    restart: unless-stopped
-    networks:
-      - geosearch-network
-
-  # Ollama — local LLM server (http://localhost:11434)
-  # Pull a model after first start:  docker exec -it ollama ollama pull llama3
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
     restart: unless-stopped
     networks:
       - geosearch-network
@@ -267,19 +254,17 @@ services:
       NCBI_API_KEY: ${NCBI_API_KEY:-}
       NCBI_TOOL: GEOSearch
       RATE_LIMIT_QPS: ${RATE_LIMIT_QPS:-3.0}
-      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-local}
-      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-NeuML/pubmedbert-base-embeddings}
-      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-azure_openai}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-large}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-3072}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-small}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-text-embedding-3-large}
       SEMANTIC_TOP_K: ${SEMANTIC_TOP_K:-500}
       LEXICAL_TOP_K: ${LEXICAL_TOP_K:-100}
       FINAL_TOP_K: ${FINAL_TOP_K:-50}
       RRF_K: ${RRF_K:-60}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       LLM_PROVIDER: ${LLM_PROVIDER:-auto}
-      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://ollama:11434}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3}
       LLM_MODEL: ${LLM_MODEL:-}
     command: uvicorn api:app --host 0.0.0.0 --port 8080 --workers 2
     ports:
@@ -294,6 +279,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
@@ -305,8 +291,6 @@ services:
       - geosearch-network
 
 volumes:
-  ollama_data:
-    driver: local
   postgres_data:
     driver: local
   etcd_data:

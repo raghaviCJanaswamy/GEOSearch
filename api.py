@@ -9,16 +9,21 @@ Docker: add a new service in docker-compose.prod.yml that runs this file.
 """
 from __future__ import annotations
 
+import json
 import logging
+import uuid
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from db import GSESeries, get_db
+from expression.archs4 import get_archs4
 from llm.qa import generate_answer
 from search.hybrid_search import HybridSearchEngine
 
@@ -60,7 +65,9 @@ class SearchRequest(BaseModel):
     use_semantic: bool = True
     use_lexical: bool = True
     use_mesh: bool = True
+    use_judge: bool = Field(False, description="Run LLM relevance judge on top results (slower, adds tier/reason per result)")
     top_k: int = Field(50, ge=1, le=500)
+    expression_genes: str | None = Field(None, description="Comma-separated gene symbols to filter expression TSV, e.g. FOXP3,CD8A")
 
 
 class MeshTermMatch(BaseModel):
@@ -78,6 +85,12 @@ class SearchMeta(BaseModel):
     lexical_count: int
     total_results: int
     filters_applied: dict[str, Any]
+    judge_used: bool = False
+    relevant_count: int = 0
+    borderline_count: int = 0
+    not_relevant_count: int = 0
+    unjudged_count: int = 0
+    judge_coverage: int = 0
 
 
 class SearchResponse(BaseModel):
@@ -114,6 +127,7 @@ class StatsResponse(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _build_filters(filters: SearchFilters | None) -> dict[str, Any]:
     """Convert Pydantic SearchFilters to the dict format HybridSearchEngine expects."""
     if filters is None:
@@ -143,8 +157,12 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/search", response_model=SearchResponse, tags=["Search"])
-def search_post(body: SearchRequest, db: Session = Depends(get_db)):
+@app.post("/search", tags=["Search"])
+def search_post(
+    body: SearchRequest,
+    format: str | None = Query(None, description="Response format: omit=JSON, 'tsv'=TSV-only stream, 'multipart'=JSON+TSV in one response"),
+    db: Session = Depends(get_db),
+):
     """
     Hybrid search over GEO datasets.
 
@@ -154,6 +172,13 @@ def search_post(body: SearchRequest, db: Session = Depends(get_db)):
     - **MeSH expansion** — medical synonyms added to query before embedding
 
     Results are ranked with Reciprocal Rank Fusion (RRF).
+
+    **Response format** (via `?format=` query param):
+    - *(omitted)* — JSON search results with expression summary links per dataset
+    - `tsv` — expression matrices for all matched datasets as a streaming TSV attachment
+    - `multipart` — single response with JSON results (part 1) + TSV attachment (part 2)
+
+    Optionally filter genes with `expression_genes` in the request body (e.g. `"expression_genes": "FOXP3,CD8A"`).
     """
     try:
         engine = HybridSearchEngine(db)
@@ -163,28 +188,122 @@ def search_post(body: SearchRequest, db: Session = Depends(get_db)):
             use_semantic=body.use_semantic,
             use_lexical=body.use_lexical,
             use_mesh=body.use_mesh,
+            use_judge=body.use_judge,
             top_k=body.top_k,
         )
     except Exception as exc:
         logger.exception("Search failed")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return SearchResponse(
+    fmt = (format or "").lower()
+
+    gene_filter = (
+        {g.strip().upper() for g in body.expression_genes.split(",")}
+        if body.expression_genes
+        else None
+    )
+
+    archs4 = get_archs4()
+
+    def _iter_expression_tsv(results, gene_filter):
+        """Yield TSV rows for all results that have expression data in ARCHS4."""
+        header_written = False
+        for r in results:
+            acc = r["accession"]
+            try:
+                for line in archs4.iter_expression_tsv(acc, gene_filter=gene_filter):
+                    if not header_written and line.startswith("accession\t"):
+                        yield line
+                        header_written = True
+                    elif not line.startswith("accession\t"):
+                        yield line
+            except KeyError:
+                continue
+
+    # --- TSV-only stream mode ---
+    if fmt == "tsv":
+        tsv_filename = f"geosearch_expression_{body.query[:30].replace(' ', '_')}.tsv"
+        return StreamingResponse(
+            _iter_expression_tsv(raw["results"], gene_filter),
+            media_type="text/tab-separated-values",
+            headers={"Content-Disposition": f'attachment; filename="{tsv_filename}"'},
+        )
+
+    # --- Annotate results with expression metadata (used by JSON and multipart) ---
+    # One H5 scan for all accessions instead of one scan per result
+    accessions = [r["accession"] for r in raw["results"]]
+    expr_info_map = archs4.batch_gse_info(accessions)
+    for r in raw["results"]:
+        acc = r["accession"]
+        info = expr_info_map.get(acc)
+        if info:
+            r["has_expression"] = True
+            r["expression_summary"] = {
+                "gene_count": info["gene_count"],
+                "sample_count": info["sample_count"],
+                "file_format": info["file_format"],
+                "expression_url": f"/expression/{acc}",
+                "download_url": f"/expression/{acc}/download",
+            }
+        else:
+            r["has_expression"] = False
+            r["expression_summary"] = None
+
+    search_response = SearchResponse(
         results=raw["results"],
         metadata=SearchMeta(**raw["metadata"]),
     )
 
+    # --- Multipart mode: JSON part + TSV attachment in one response ---
+    if fmt == "multipart":
+        boundary = uuid.uuid4().hex
+        json_bytes = search_response.model_dump_json().encode()
+        tsv_filename = f"geosearch_expression_{body.query[:30].replace(' ', '_')}.tsv"
 
-@app.get("/search", response_model=SearchResponse, tags=["Search"])
+        def generate_multipart():
+            # Part 1: JSON search results
+            yield (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: inline; name="results"\r\n'
+                f"Content-Type: application/json\r\n\r\n"
+            ).encode()
+            yield json_bytes
+            yield b"\r\n"
+
+            # Part 2: TSV expression matrices
+            yield (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: attachment; name="expression"; filename="{tsv_filename}"\r\n'
+                f"Content-Type: text/tab-separated-values\r\n\r\n"
+            ).encode()
+            for chunk in _iter_expression_tsv(raw["results"], gene_filter):
+                yield chunk.encode()
+            yield b"\r\n"
+
+            yield f"--{boundary}--\r\n".encode()
+
+        return StreamingResponse(
+            generate_multipart(),
+            media_type=f"multipart/mixed; boundary={boundary}",
+        )
+
+    # --- Default JSON mode ---
+    return search_response
+
+
+@app.get("/search", tags=["Search"])
 def search_get(
     q: str = Query(..., description="Search query", example="breast cancer RNA-seq"),
     top_k: int = Query(50, ge=1, le=500, description="Number of results"),
     semantic: bool = Query(True, description="Enable semantic search"),
     lexical: bool = Query(True, description="Enable lexical search"),
     mesh: bool = Query(True, description="Enable MeSH query expansion"),
+    judge: bool = Query(False, description="Run LLM relevance judge (slower, adds tier/reason per result)"),
     organisms: list[str] | None = Query(None, description="Filter by organism(s)"),
     tech_type: str | None = Query(None, description="Filter by technology type"),
     min_samples: int | None = Query(None, ge=1, description="Minimum sample count"),
+    expression_genes: str | None = Query(None, description="Comma-separated gene symbols to filter expression TSV, e.g. FOXP3,CD8A"),
+    format: str | None = Query(None, description="'tsv' for TSV-only stream, 'multipart' for JSON+TSV in one response"),
     db: Session = Depends(get_db),
 ):
     """
@@ -192,6 +311,7 @@ def search_get(
 
     Example:
         GET /search?q=breast+cancer+RNA-seq&top_k=10&organisms=Homo+sapiens
+        GET /search?q=breast+cancer&format=tsv&expression_genes=FOXP3,CD8A
     """
     filters_obj = SearchFilters(
         organisms=organisms,
@@ -204,9 +324,11 @@ def search_get(
         use_semantic=semantic,
         use_lexical=lexical,
         use_mesh=mesh,
+        use_judge=judge,
         top_k=top_k,
+        expression_genes=expression_genes,
     )
-    return search_post(body, db)
+    return search_post(body, format=format, db=db)
 
 
 @app.post("/ask", response_model=AskResponse, tags=["Q&A"])
@@ -302,3 +424,76 @@ def get_dataset(accession: str, db: Session = Depends(get_db)):
     result = gse.to_dict()
     result["geo_url"] = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession.upper()}"
     return result
+
+
+# ---------------------------------------------------------------------------
+# Expression matrix endpoints — backed by ARCHS4 H5 file
+# ---------------------------------------------------------------------------
+
+@app.get("/expression", tags=["Expression"])
+def list_expression():
+    """List all datasets available in the ARCHS4 H5 file is not enumerable.
+
+    Returns metadata about the H5 source instead.
+    """
+    archs4 = get_archs4()
+    return {
+        "source": "ARCHS4",
+        "gene_count": len(archs4.gene_symbols),
+        "note": "Query /expression/{accession} for a specific GSE.",
+    }
+
+
+@app.get("/expression/{accession}", tags=["Expression"])
+def get_expression(
+    accession: str,
+    genes: str | None = Query(None, description="Comma-separated gene symbols to filter, e.g. FOXP3,CD8A"),
+    samples: str | None = Query(None, description="Comma-separated GSM IDs to filter"),
+):
+    """
+    Return the expression matrix for a dataset directly from the ARCHS4 H5 file.
+
+    - **accession**: GEO accession, e.g. GSE98386
+    - **genes**: optional comma-separated gene symbols to return (all genes if omitted)
+    - **samples**: optional comma-separated GSM IDs to return (all samples if omitted)
+
+    Response shape:
+        { accession, genes: [...], samples: [...], matrix: [[...], ...] }
+    """
+    acc = accession.upper()
+    gene_filter = {g.strip().upper() for g in genes.split(",")} if genes else None
+    sample_filter = {s.strip() for s in samples.split(",")} if samples else None
+
+    try:
+        return get_archs4().get_expression(acc, gene_filter=gene_filter, sample_filter=sample_filter)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"No expression data found in ARCHS4 for {acc}")
+
+
+@app.get("/expression/{accession}/download", tags=["Expression"])
+def download_expression(
+    accession: str,
+    genes: str | None = Query(None, description="Comma-separated gene symbols to filter"),
+    samples: str | None = Query(None, description="Comma-separated GSM IDs to filter"),
+):
+    """
+    Download the expression matrix as a TSV file, read directly from the ARCHS4 H5 file.
+
+    - **accession**: GEO accession, e.g. GSE98386
+    - **genes**: optional comma-separated gene symbols (all genes if omitted)
+    - **samples**: optional comma-separated GSM IDs (all samples if omitted)
+    """
+    acc = accession.upper()
+    gene_filter = {g.strip().upper() for g in genes.split(",")} if genes else None
+    sample_filter = {s.strip() for s in samples.split(",")} if samples else None
+
+    archs4 = get_archs4()
+    if not archs4.has_gse(acc):
+        raise HTTPException(status_code=404, detail=f"No expression data found in ARCHS4 for {acc}")
+
+    filename = f"{acc}_expression.tsv"
+    return StreamingResponse(
+        archs4.iter_expression_tsv(acc, gene_filter=gene_filter, sample_filter=sample_filter),
+        media_type="text/tab-separated-values",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )

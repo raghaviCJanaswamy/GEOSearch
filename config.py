@@ -38,13 +38,13 @@ class Settings(BaseSettings):
     rate_limit_qps: float = 3.0  # Queries per second
 
     # Embeddings
-    embedding_provider: Literal["local", "openai", "azure_openai"] = "local"
-    embedding_model: str = "NeuML/pubmedbert-base-embeddings"
-    embedding_dimension: int = 768
+    embedding_provider: Literal["local", "openai", "azure_openai"] = "azure_openai"
+    embedding_model: str = "text-embedding-3-large"
+    embedding_dimension: int = 3072
 
     # OpenAI
     openai_api_key: str | None = None
-    openai_embedding_model: str = "text-embedding-3-small"
+    openai_embedding_model: str = "text-embedding-3-large"
 
     # Azure OpenAI
     azure_openai_api_key: str | None = None
@@ -53,10 +53,10 @@ class Settings(BaseSettings):
     azure_openai_deployment: str | None = None
 
     # LLM Q&A
-    llm_provider: str = "auto"           # "auto" | "ollama" | "openai" | "none"
+    llm_provider: str = "auto"           # "auto" | "openai" | "azure_openai" | "none"
     llm_model: str | None = None         # override model name per provider
-    ollama_base_url: str = "http://localhost:11434"
-    ollama_model: str = "llama3"         # model tag pulled in Ollama
+    ollama_base_url: str = "http://localhost:11434"  # unused — Ollama not in stack
+    ollama_model: str = "llama3"                     # unused — Ollama not in stack
 
     # Search
     semantic_top_k: int = 1000  # Milvus candidates — raised to 1000 so high-volume queries

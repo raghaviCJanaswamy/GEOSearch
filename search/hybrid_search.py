@@ -42,6 +42,7 @@ class HybridSearchEngine:
         use_lexical: bool = True,
         use_mesh: bool = True,
         top_k: int | None = None,
+        use_judge: bool | None = None,
     ) -> dict[str, Any]:
         """
         Perform hybrid search.
@@ -66,6 +67,33 @@ class HybridSearchEngine:
             ... )
         """
         filters = filters or {}
+
+        # Fast path: bare GSE accession lookup (e.g. "GSE98386")
+        _acc_match = re.fullmatch(r"(GSE\d+)", query.strip(), re.IGNORECASE)
+        if _acc_match:
+            acc = _acc_match.group(1).upper()
+            gse = self.db.query(GSESeries).filter(GSESeries.accession == acc).first()
+            if gse:
+                result = gse.to_dict()
+                result["geo_url"] = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={acc}"
+                result["score"] = 1.0
+                result["rank"] = 1
+                result["tier"] = "relevant"
+                result["reason"] = "Exact accession match"
+                logger.info(f"Exact accession match: {acc}")
+                return {
+                    "results": [result],
+                    "metadata": {
+                        "query": query,
+                        "expanded_query": query,
+                        "mesh_terms": [],
+                        "semantic_count": 0,
+                        "lexical_count": 0,
+                        "total_results": 1,
+                        "filters_applied": filters,
+                        "judge_used": False,
+                    },
+                }
 
         logger.info(
             f"Hybrid search: query='{query}', "
@@ -231,7 +259,8 @@ class HybridSearchEngine:
         # returned as-is with tier="unjudged" and reason="" on every result.
         judge_meta = {"judge_used": False, "relevant_count": 0, "borderline_count": 0,
                       "unjudged_count": 0, "judge_coverage": 0}
-        if settings.judge_enabled and final_results:
+        run_judge = settings.judge_enabled if use_judge is None else use_judge
+        if run_judge and final_results:
             to_judge = final_results[:settings.judge_top_k]
             remainder = final_results[settings.judge_top_k:]
             try:

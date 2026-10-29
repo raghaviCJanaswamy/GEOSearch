@@ -18,6 +18,7 @@ from sqlalchemy import String, distinct, func, or_
 
 from config import settings
 from db import GSESeries
+from expression.archs4 import get_archs4
 from db.session import SessionLocal
 from search import HybridSearchEngine
 from streamlit_ingest import show_ingestion_interface
@@ -389,6 +390,7 @@ def perform_search(
     use_semantic: bool,
     use_lexical: bool,
     use_mesh: bool,
+    use_judge: bool = False,
 ) -> dict[str, Any]:
     """Perform search with caching. Returns all matched results for client-side pagination."""
     db = SessionLocal()
@@ -413,6 +415,7 @@ def perform_search(
             use_semantic=use_semantic,
             use_lexical=use_lexical,
             use_mesh=use_mesh,
+            use_judge=use_judge,
         )
     finally:
         db.close()
@@ -500,8 +503,9 @@ def render_mesh_term_badge(mesh_term: dict[str, Any]) -> None:
 
 def render_result_card(result: dict[str, Any]) -> None:
     """Render a compact search result card."""
+    import html as _html
     accession = result["accession"]
-    title = result["title"] or ""
+    title = _html.escape(result["title"] or "")
 
     # Metadata pills
     meta_parts = []
@@ -534,7 +538,7 @@ def render_result_card(result: dict[str, Any]) -> None:
 
     # Judge tier badge + reason
     tier = result.get("tier", "")
-    reason = result.get("reason", "")
+    reason = _html.escape(result.get("reason", "") or "")
     tier_html = ""
     if tier == "relevant":
         tier_html = (
@@ -579,11 +583,38 @@ def render_result_card(result: dict[str, Any]) -> None:
   {pubmed_html}
 </div>
 """
-    st.markdown(card_html, unsafe_allow_html=True)
-    if st.button("🧬 Analyze", key=f"analyze_{accession}", help="Open in Expression Analysis pipeline"):
-        st.session_state["analysis_gse_id"] = accession
-        st.session_state["nav_page"] = "🧬 Analysis"
-        st.rerun()
+    st.html(card_html)
+
+    # Check expression data — from search result summary or direct H5 lookup
+    expr_summary = result.get("expression_summary")
+    if expr_summary is None:
+        info = get_archs4().gse_info(accession)
+        if info:
+            expr_summary = info
+
+    if expr_summary:
+        gene_count = expr_summary.get("gene_count", "")
+        sample_count = expr_summary.get("sample_count", "")
+        label = f"⬇ Expression Matrix ({gene_count:,} genes × {sample_count} samples)" if gene_count else "⬇ Expression Matrix"
+        _expr_key = f"expr_data_{accession}"
+        if _expr_key not in st.session_state:
+            st.session_state[_expr_key] = None
+
+        if st.button(label, key=f"load_expr_{accession}", help="Download expression matrix as TSV"):
+            try:
+                tsv_lines = list(get_archs4().iter_expression_tsv(accession))
+                st.session_state[_expr_key] = "".join(tsv_lines).encode()
+            except KeyError:
+                st.warning("No expression data found in ARCHS4 for this dataset.")
+
+        if st.session_state.get(_expr_key):
+            st.download_button(
+                label="💾 Save TSV",
+                data=st.session_state[_expr_key],
+                file_name=f"{accession}_expression.tsv",
+                mime="text/tab-separated-values",
+                key=f"dl_expr_{accession}",
+            )
 
 
 
@@ -1051,12 +1082,12 @@ def main() -> None:
     if nav_state in legacy_page_map:
         nav_state = legacy_page_map[nav_state]
 
-    # Admin users see all 6 items; general users see 4 (no ingest/download)
+    # Admin users see all 6 items; general users see Search only
     if st.session_state["is_admin"]:
         nav_labels = ["Search", "Analytics", "Analysis", "Data Ingestion", "NCBI Downloads", "Settings"]
     else:
-        nav_labels = ["Search", "Analytics", "Analysis"]
-        if nav_state in ("ingest", "download", "docs"):
+        nav_labels = ["Search"]
+        if nav_state in ("ingest", "download", "docs", "analytics", "analysis"):
             nav_state = "search"
 
     nav_default = nav_labels.index(reverse_page_map.get(nav_state, "Search")) if reverse_page_map.get(nav_state, "Search") in nav_labels else 0
@@ -1161,7 +1192,7 @@ def main() -> None:
     st.markdown(
         """
 <div style="font-size:1.8rem;font-weight:800;color:var(--app-title);letter-spacing:-0.35px;margin:0 0 0.7rem 0;line-height:1.2;text-align:center;">
-  🔬 GEO: AI Based Biomedical Datasets Discovery
+  🔬 GEOSearch: AI Powered NCBI GEO Explorer
 </div>
 """,
         unsafe_allow_html=True,
@@ -1274,17 +1305,25 @@ def main() -> None:
                 min_value=date_min.date() if date_min else None,
                 max_value=date_max.date() if date_max else None) if date_min and date_max else None
 
-        sc1, sc2, sc3 = st.columns(3)
+        sc1, sc2, sc3, sc4 = st.columns(4)
         use_semantic = sc1.checkbox("Semantic search", value=True, help="AI vector similarity")
         use_lexical  = sc2.checkbox("Keyword search",  value=True, help="Full-text search")
         use_mesh     = sc3.checkbox("MeSH expansion",  value=True, help="Medical synonym expansion")
+        use_judge    = sc4.checkbox("AI Judge", value=True, help="LLM relevance filter — slower but adds relevance tiers to results")
 
         st.caption("Leave the query blank to list all datasets that match the selected filters, such as Homo sapiens in a custom date range.")
 
     # Perform search
     has_filters = bool(organisms) or (tech_type and tech_type != "All") or bool(date_start) or bool(date_end)
 
-    if search_clicked and query:
+    judge_toggled = (
+        not search_clicked
+        and st.session_state.get("_results") is not None
+        and st.session_state.get("_use_judge") != use_judge
+        and bool(st.session_state.get("_search_query"))
+    )
+
+    if (search_clicked or judge_toggled) and query:
         with st.spinner("Searching..."):
             try:
                 results = perform_search(
@@ -1296,10 +1335,12 @@ def main() -> None:
                     use_semantic=use_semantic,
                     use_lexical=use_lexical,
                     use_mesh=use_mesh,
+                    use_judge=use_judge,
                 )
                 st.session_state["_results"] = results
                 st.session_state["_search_query"] = query
                 st.session_state["_use_mesh"] = use_mesh
+                st.session_state["_use_judge"] = use_judge
                 st.session_state.page = 1
 
                 # Export annotation comparison to output/

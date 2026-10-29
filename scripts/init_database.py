@@ -16,7 +16,7 @@ from sqlalchemy import text
 
 from config import settings
 from db import init_db, get_db, engine
-from db.models import GSESeries, MeshTerm, IngestRun, Base
+from db.models import GSESeries, MeshTerm, IngestRun, ExpressionFile, Base
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

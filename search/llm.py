@@ -13,6 +13,13 @@ import time
 import urllib.error
 import urllib.request
 
+# Load .env so module-level os.environ reads below work in local dev
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT", "").rstrip("/")
 # The /responses endpoint requires 2025-04-01-preview or later.
 # AZURE_OPENAI_API_VERSION in .env may point to an older version for embeddings,
