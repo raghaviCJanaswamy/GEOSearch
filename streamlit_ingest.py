@@ -76,9 +76,6 @@ def show_ingestion_interface() -> None:
     with tab5:
         show_ingestion_config()
     
-    with tab4:
-        show_database_initialization()
-
     with tab6:
         show_database_initialization()
 
@@ -753,20 +750,32 @@ def show_ingestion_config() -> None:
     ])
 
     # ── Vector Database (Milvus) ──────────────────────────────────────────────
+    collection = getattr(settings, "milvus_collection_name", "gse_embeddings")
+    milvus_host = getattr(settings, "milvus_host", "milvus")
+    milvus_port = getattr(settings, "milvus_port", 19530)
+    vec_count = 0
+    milvus_status = "❌ Disconnected"
     try:
-        from vector.milvus_store import MilvusStore
-        ms = MilvusStore()
-        vec_count = ms.count()
-        collection = getattr(settings, "milvus_collection_name", "gse_embeddings")
-        milvus_host = getattr(settings, "milvus_host", "milvus")
-        milvus_port = getattr(settings, "milvus_port", 19530)
-        milvus_status = "✅ Connected"
+        import threading
+        _result = {}
+        def _milvus_check():
+            try:
+                from vector.milvus_store import MilvusStore
+                ms = MilvusStore()
+                _result["count"] = ms.count()
+                _result["ok"] = True
+            except Exception as e:
+                _result["error"] = str(e)
+        t = threading.Thread(target=_milvus_check, daemon=True)
+        t.start()
+        t.join(timeout=5)
+        if _result.get("ok"):
+            vec_count = _result["count"]
+            milvus_status = "✅ Connected"
+        elif t.is_alive():
+            milvus_status = "⚠️ Timeout"
     except Exception:
-        vec_count = 0
-        collection = getattr(settings, "milvus_collection_name", "gse_embeddings")
-        milvus_host = getattr(settings, "milvus_host", "milvus")
-        milvus_port = getattr(settings, "milvus_port", 19530)
-        milvus_status = "❌ Disconnected"
+        pass
 
     _section("🗄️ Vector Database (Milvus)", [
         _row("Host", f"{milvus_host}:{milvus_port}"),
@@ -831,23 +840,6 @@ def show_ingestion_config() -> None:
         _row("API Key", "✅ Set" if getattr(settings, "ncbi_api_key", None) else "❌ Not set"),
         _row("Rate Limit", f"{rate} req/s"),
         _row("Base URL", "eutils.ncbi.nlm.nih.gov"),
-    ])
-
-    # ── LLM / RAG ─────────────────────────────────────────────────────────────
-    ollama_host  = getattr(settings, "ollama_host", "ollama")
-    ollama_port  = getattr(settings, "ollama_port", 11434)
-    ollama_model = getattr(settings, "ollama_model", "llama3")
-    try:
-        import requests as _req
-        r = _req.get(f"http://{ollama_host}:{ollama_port}/api/tags", timeout=3)
-        ollama_status = "✅ Running"
-    except Exception:
-        ollama_status = "❌ Offline"
-
-    _section("🤖 LLM / RAG (Ollama)", [
-        _row("Host", f"{ollama_host}:{ollama_port}"),
-        _row("Model", ollama_model),
-        _row("Status", ollama_status),
     ])
 
     # Database statistics

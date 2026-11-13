@@ -162,6 +162,9 @@ def main():
                 flush=True,
             )
 
+    print("Flushing Milvus collection to disk...", flush=True)
+    store.collection.flush()
+    print("Flush complete.", flush=True)
     db.close()
 
     elapsed = time.time() - t_start

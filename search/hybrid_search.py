@@ -351,6 +351,7 @@ class HybridSearchEngine:
         mesh_terms: list[str] | None = None,
         mesh_concept_groups: list[set[str]] | None = None,
         mesh_id_to_name: dict[str, str] | None = None,
+        top_k: int = 10000,
     ) -> list[dict[str, Any]]:
         """
         Perform lexical search using PostgreSQL full-text search.

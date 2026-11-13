@@ -131,8 +131,12 @@ def load_reference(path=REFERENCE_PATH):
     """Load the GEO_SEARCH.md reference doc that forms the first part of
     every rewrite prompt. Cached at module load so it is prompt-cached by
     the Azure endpoint across calls."""
-    with open(path, encoding="utf-8") as fh:
-        return fh.read().strip()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        print(f"WARNING: GEO_SEARCH.md not found at {path} — rewriter will use minimal context")
+        return "# GEOSearch Reference\nSearch NCBI GEO datasets by topic."
 
 
 REFERENCE = load_reference()

@@ -391,6 +391,7 @@ def perform_search(
     use_lexical: bool,
     use_mesh: bool,
     use_judge: bool = False,
+    min_samples: int | None = None,
 ) -> dict[str, Any]:
     """Perform search with caching."""
     db = SessionLocal()
@@ -1192,7 +1193,6 @@ def main() -> None:
 """,
         unsafe_allow_html=True,
     )
-    page = selected
 
     st.markdown(
         """

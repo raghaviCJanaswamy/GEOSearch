@@ -120,7 +120,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - ./expressiondata:/app/expressiondata:ro
     command: >
       bash -c "
         echo 'Waiting for Postgres to accept connections...' &&
@@ -221,7 +221,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - ./expressiondata:/app/expressiondata:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
       interval: 10s
@@ -279,7 +279,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - ./human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - ./expressiondata:/app/expressiondata:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s

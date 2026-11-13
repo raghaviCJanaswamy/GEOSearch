@@ -123,7 +123,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - /home/exouser/GEOSearch/human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - /home/exouser/GEOSearch/expressiondata:/app/expressiondata:ro
 
     # init_database.py uses CREATE TABLE IF NOT EXISTS — safe to run every time
     command: >
@@ -195,7 +195,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - /home/exouser/GEOSearch/human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - /home/exouser/GEOSearch/expressiondata:/app/expressiondata:ro
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
@@ -259,7 +259,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - /home/exouser/GEOSearch/human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - /home/exouser/GEOSearch/expressiondata:/app/expressiondata:ro
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -317,7 +317,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
-      - /home/exouser/GEOSearch/human_gene_v2.latest.h5:/app/human_gene_v2.latest.h5:ro
+      - /home/exouser/GEOSearch/expressiondata:/app/expressiondata:ro
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8090/health"]
