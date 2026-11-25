@@ -439,7 +439,7 @@ def list_expression():
     archs4 = get_archs4()
     return {
         "source": "ARCHS4",
-        "gene_count": len(archs4.gene_symbols),
+        "loaded_files": archs4.loaded_files,
         "note": "Query /expression/{accession} for a specific GSE.",
     }
 
